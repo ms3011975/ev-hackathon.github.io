@@ -4,6 +4,27 @@ const sim = require('../web/simulation.js');
 const fs = require('node:fs');
 const vm = require('node:vm');
 
+test('personal Pages uses public snapshots only when local data is absent', async () => {
+  const template = fs.readFileSync(require.resolve('../web/index.template.html'), 'utf8');
+  const detector = template.match(/async function detectServer\([^]*?\n}/)[0];
+  async function check(hostname, local) {
+    const calls = [], region = {code:'43110'};
+    const status = {ok:true,regions:{'43110':{}}};
+    const context = {state:{region,staticBase:''},REGIONS:[region],location:{hostname},
+      getJSON:async url=>{calls.push(url); return url==='data/status.json'?local:url.startsWith('https:')?status:null;},
+      renderRegions(){},refresh(){},loadLive(){},setInterval(){}};
+    vm.createContext(context); vm.runInContext(detector,context); await context.detectServer();
+    return {calls,state:context.state};
+  }
+  const personal = await check('ms3011975.github.io',null);
+  assert.equal(personal.state.staticBase,'https://ev-hackathon.github.io/');
+  assert.equal(personal.state.server,'static');
+  const local = await check('ms3011975.github.io',{ok:true,regions:{'43110':{}}});
+  assert.deepEqual(local.calls,['data/status.json']);
+  const original = await check('ev-hackathon.github.io',null);
+  assert.deepEqual(original.calls,['data/status.json','api/health']);
+});
+
 test('all generated inline JavaScript parses and status matches existing monitor classifier', () => {
   const html = fs.readFileSync(require.resolve('../docs/index.html'), 'utf8');
   for (const match of html.matchAll(/<script([^>]*)>([\s\S]*?)<\/script>/g)) {

@@ -103,7 +103,7 @@
         if (version !== dataVersion) return;
         const data = await window.ESSMonitor.stations($('sim-region').value);
         if (version !== dataVersion) return;
-        source = `실제 수집 데이터 · ${data.when || '수집 시각 미제공'} · ${data.kind === 'snapshot' ? '저장본' : '마지막 수집 상태'}`;
+        source = `실제 수집 데이터 · ${data.when || '수집 시각 미제공'} · ${data.dataSource ? 'ev-hackathon 공개 저장본' : data.kind === 'snapshot' ? '저장본' : '마지막 수집 상태'}`;
         const pair = choosePool(data.list.map(s => ({ id: s.id, name: s.name, lat: s.lat, lng: s.lng, speed,
           ...s[speed], unknown: s[speed].total - s[speed].avail - s[speed].charging - s[speed].fault, source: s[speed].src || '기존 운영사 요금표' })));
         message(pool.length < 2 ? '동일 종류의 처리 가능한 충전소가 2곳 미만입니다. 예시 데이터 모드로 전환해 주세요.' : pair ? '같은 종류의 혼잡 A와 가장 가까운 여유 B를 선택했습니다. 다른 충전소도 직접 선택할 수 있습니다. 거리는 별도 설정을 확인하세요.' : '혼잡 A·여유 B 조건에 맞는 쌍이 없습니다. 비교 가능한 두 거점을 표시했습니다. 예시 데이터 모드도 사용할 수 있습니다.');
