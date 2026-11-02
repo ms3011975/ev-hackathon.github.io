@@ -4,6 +4,54 @@ const sim = require('../web/simulation.js');
 const fs = require('node:fs');
 const vm = require('node:vm');
 
+test('sensitivity baseline matches ordinary comparison and does not mutate inputs', async () => {
+  const stations = sim.demo(), options = {...sim.defaults,repeats:4}, copy = JSON.stringify({stations,options});
+  const normal = await sim.compare(stations,options), sweep = await sim.sweep(stations,options,'drivers',[12,36]);
+  assert.deepEqual(sweep.scenarios.map(s=>s.value),[12,24,36]);
+  const reference = sweep.scenarios.find(s=>s.value===24);
+  for (let p=0;p<3;p++) {
+    assert.deepEqual(reference.results[p].records, normal.results[p].records);
+    assert.equal(reference.results[p].wait,normal.results[p].wait);
+    assert.equal(reference.results[p].waitDelta,0);
+  }
+  const fewer = sweep.scenarios[0].results[0].records;
+  const more = sweep.scenarios[2].results[0].records;
+  for (const d of fewer) assert.equal(d.arrival,more.find(x=>x.driver===d.driver).arrival);
+  assert.equal(JSON.stringify({stations,options}),copy);
+});
+test('sensitivity reuses randomness, is reproducible and handles percentages, modes and forecast', async () => {
+  const options = {...sim.defaults,repeats:3};
+  const a = await sim.sweep(sim.demo(),options,'discount',[0,.2,.4]);
+  assert.deepEqual(a,await sim.sweep(sim.demo(),options,'discount',[0,.2,.4]));
+  for (const s of a.scenarios) assert.deepEqual(s.results[0].records,a.scenarios[0].results[0].records);
+  for (const s of a.scenarios) for (const r of s.results) assert.ok(Math.abs(r.waitDelta-(r.wait-a.scenarios.find(x=>x.value===a.baseline).results[r.policy].wait))<1e-9);
+  const f = await sim.sweep(sim.demo(),options,'discount',[.3],()=>{}, {'DEMO-A':.2,'DEMO-B':1});
+  assert.equal(f.scenarios.find(x=>x.value===.3).results[1].prices[0],243);
+  const modes = await sim.sweep(sim.demo(),options,'durationMode',['power']);
+  assert.equal(modes.scenarios.length,2);
+});
+test('sensitivity rejects invalid input, excessive work and supports cancellation', async () => {
+  const options = {...sim.defaults,repeats:2};
+  for (const [key,values] of [['seed',[1]],['drivers',[1.2]],['alpha',[NaN]],['threshold',[1]],['energy',[]],['drivers',Array(9).fill(24)]]) await assert.rejects(sim.sweep(sim.demo(),options,key,values));
+  await assert.rejects(sim.sweep(sim.demo(),{...options,repeats:500,drivers:500},'alpha',[1,2,3]),/분석량/);
+  let cancel=false;
+  await assert.rejects(sim.sweep(sim.demo(),options,'alpha',[300,900],()=>{cancel=true;},undefined,()=>cancel),/중단/);
+});
+test('evidence distinguishes observed status, tariff fallback, assumptions and computed distance', () => {
+  const stations=sim.demo(); stations[0].source='운영사'; stations[1].source='공공 기준(미등재)';
+  const rows=sim.evidence(stations,sim.defaults,{mode:'real',distanceMode:'coords',source:'test timestamp'});
+  assert.equal(rows.find(r=>r.item==='A 초기 충전기 상태').kind,'실측·수집값');
+  assert.equal(rows.find(r=>r.item==='A 기본 단가').kind,'공시값');
+  assert.equal(rows.find(r=>r.item==='B 기본 단가').kind,'추정값');
+  assert.equal(rows.find(r=>r.item==='B 추가 거리').kind,'추정값');
+  assert.equal(rows.find(r=>r.item==='신규 운전자').kind,'가정값');
+  const demo=sim.evidence(stations,sim.defaults,{mode:'demo',distanceMode:'manual'});
+  assert.ok(!demo.some(r=>r.kind==='실측·수집값'));
+  assert.equal(demo.find(r=>r.item==='B 추가 거리').kind,'가정값');
+  const forecast=sim.evidence(stations,sim.defaults,{mode:'real',forecastRequested:true});
+  assert.equal(forecast.find(r=>r.item==='요금 판정 근거').kind,'미입력');
+});
+
 test('personal Pages uses public snapshots only when local data is absent', async () => {
   const template = fs.readFileSync(require.resolve('../web/index.template.html'), 'utf8');
   const detector = template.match(/async function detectServer\([^]*?\n}/)[0];

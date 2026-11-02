@@ -113,11 +113,12 @@
       expectedWait: estimated / o.drivers, fee: charge / o.drivers, distance: distance / o.drivers,
       discount, revenue: charge, completion, records };
   }
-  async function compare(stations, options = {}, onProgress = () => {}, utilizationById) {
+  async function compare(stations, options = {}, onProgress = () => {}, utilizationById, control = {}) {
     const o = { ...defaults, ...options }; validate(stations, o);
     const random = rng(o.seed), results = policies.map((label, policy) => ({ label, policy, count: [0, 0], share: [0, 0], wait: 0, expectedWait: 0, fee: 0, distance: 0, discount: 0, revenue: 0, completion: 0, samples: [] }));
     for (let r = 0; r < o.repeats; r++) {
-      const people = population(stations, o, random);
+      if (control.cancelled?.()) throw new Error('분석을 중단했습니다.');
+      const people = control.populations ? control.populations[r] : population(stations, o, random);
       for (let p = 0; p < 3; p++) {
         const run = runPolicy(stations, o, people, p, utilizationById), out = results[p];
         for (const key of ['wait', 'expectedWait', 'fee', 'distance', 'discount', 'revenue', 'completion']) out[key] += run[key] / o.repeats;
@@ -136,5 +137,63 @@
     }
     onProgress(1); return { options: o, stations: stations.map(s => ({ ...s })), results };
   }
-  return { defaults, policies, demo, rng, status, price, probability, validate, population, runPolicy, compare, forecast };
+  const sweepKeys = ['drivers', 'minutes', 'energy', 'sensitivity', 'alpha', 'beta', 'tau', 'distance', 'discount', 'surcharge', 'threshold', 'durationMode'];
+  async function sweep(stations, options, key, values, onProgress = () => {}, utilizationById, cancelled = () => false) {
+    const base = { ...defaults, ...options }; validate(stations, base);
+    if (!sweepKeys.includes(key) || !Array.isArray(values) || !values.length || values.length > 8) throw new Error('비교 항목과 1~8개 수준을 확인하세요.');
+    const levels = [...new Set([base[key], ...values])].sort((a, b) => typeof a === 'number' ? a - b : String(a).localeCompare(String(b)));
+    for (const value of levels) validate(stations, { ...base, [key]: value });
+    const maxDrivers = key === 'drivers' ? Math.max(...levels) : base.drivers;
+    if (levels.length * base.repeats * maxDrivers * 3 > 2000000) throw new Error('분석량이 큽니다. 비교 수준·운전자 수·반복 횟수를 줄여 주세요 (최대 200만 차량·정책 계산).');
+    // Reuse the exact baseline populations, including initial residuals. Extra drivers
+    // have a separate stream so increasing N never changes the baseline random draws.
+    const random = rng(base.seed), bank = [];
+    for (let r = 0; r < base.repeats; r++) {
+      const people = population(stations, base, random), extraRandom = rng((base.seed ^ Math.imul(r + 1, 0x9e3779b1)) >>> 0);
+      const drivers = people.drivers.map(d => ({ ...d }));
+      for (let id = base.drivers; id < maxDrivers; id++) drivers.push({ id, arrival: extraRandom() * base.minutes, duration: 20 + extraRandom() * 20, choice: extraRandom() });
+      bank.push({ initial: people.initial, drivers });
+    }
+    const scenarios = [];
+    for (let i = 0; i < levels.length; i++) {
+      if (cancelled()) throw new Error('분석을 중단했습니다.');
+      const value = levels[i], o = { ...base, [key]: value };
+      const populations = bank.map(p => ({ initial: p.initial, drivers: p.drivers.filter(d => d.id < o.drivers)
+        .map(d => ({ ...d, arrival: o.minutes === base.minutes ? d.arrival : d.arrival / base.minutes * o.minutes })).sort((a, b) => a.arrival - b.arrival || a.id - b.id) }));
+      const output = await compare(stations, o, p => onProgress((i + p) / levels.length), utilizationById, { populations, cancelled });
+      scenarios.push({ value, ...output });
+    }
+    const reference = scenarios.find(s => s.value === base[key]);
+    for (const s of scenarios) for (const r of s.results) {
+      const ref = reference.results[r.policy];
+      r.waitDelta = r.wait - ref.wait;
+      r.shareBDelta = (r.share[1] - ref.share[1]) * 100;
+    }
+    return { key, base, baseline: base[key], scenarios };
+  }
+  function evidence(stations, o, context = {}) {
+    const rows = [], add = (item, value, kind, basis) => rows.push({ item, value, kind, basis });
+    const real = context.mode === 'real';
+    for (const [i, s] of stations.entries()) {
+      const prefix = i ? 'B' : 'A';
+      add(`${prefix} 충전소 ID·위치`, `${s.id} · ${s.lat}, ${s.lng}`, real ? '실측·수집값' : '가정값', real ? context.source : '실제 충전소가 아닌 예시 데이터');
+      add(`${prefix} 초기 충전기 상태`, `빈 ${s.avail} / 충전 중 ${s.charging} / 불가 ${s.fault} / 미확인 ${s.unknown || 0}대`, real ? '실측·수집값' : '가정값', real ? '수집 시각의 API 상태 집계. 현재 시각의 실시간 상태를 보장하지 않음' : '시연용 초기 상태');
+      add(`${prefix} 기본 단가`, `${s.base}원/kWh`, !real ? '가정값' : s.source === '운영사' ? '공시값' : '추정값', `${s.source || '운영사 요금표'} · ${s.upd || '요금표 시각 미제공'} · 실제 청구액 아님`);
+      add(`${prefix} 대표 출력`, `${s.kw}kW`, real ? '추정값' : '가정값', '기존 관제 대표 출력 사용. 원자료 출력 또는 기본 대체값이며 개별 충전기의 실효 출력과 다를 수 있음');
+    }
+    for (const [key, label, unit] of [['drivers','신규 운전자','명'],['minutes','도착 생성 기간','분'],['energy','차량당 충전량','kWh'],['sensitivity','가격 민감도','배'],['alpha','이동 비용 α','원/km'],['beta','대기 비용 β','원/분'],['tau','선택 다양성 τ','원']])
+      add(label, `${o[key]}${unit}`, '가정값', '요구사항 예시를 초기값으로 사용. 변경값은 사용자 시나리오이며 실측·통계 보정 전');
+    for (const [key, label] of [['discount','여유 할인율'],['surcharge','혼잡 할증율'],['threshold','여유 판정 대기율']])
+      add(label, `${o[key] * 100}%`, '정책 설정', '기존 프로젝트 기본 정책에서 시작. 정책 효과를 검증한 최적값이 아님');
+    add('B 추가 거리', `${o.distance}km`, context.distanceMode === 'coords' ? '추정값' : '가정값', context.distanceMode === 'coords' ? 'A/B 좌표의 직선거리. 도로 거리·이동시간 아님' : '사용자 지정 추가 거리. A는 0km 가정');
+    add('신규 충전시간', o.durationMode === 'power' ? '충전량 ÷ 대표 출력 × 60분' : '20~40분 균등분포', '가정값', '간소화 모델. 충전효율·충전곡선·출력 공유 제외');
+    add('초기 잔여 충전시간', o.durationMode === 'power' ? '0~(충전량 ÷ 대표 출력 × 60)분 균등분포' : '0~30분 균등분포', '가정값', '초기 차량의 실제 잔여시간은 관측하지 않음');
+    add('도착·선택 모형', '기간 내 균등 도착 · 로짓 선택', '가정값', '취소·포기·추가 이동시간 제외. 행동모델 실측 보정 전');
+    add('반복·난수', `${o.repeats}회 · 시드 ${o.seed}`, '실험 설정', '재현성과 반복 변동 확인용. 반복 횟수는 실세계 정확도를 보장하지 않음');
+    add('요금 판정 근거', context.pricingBasis || '현재 수집 상태', context.forecastInfo ? '추정값' : context.forecastRequested ? '미입력' : real ? '실측·수집값' : '가정값', context.forecastInfo ? `${context.forecastInfo} · 외부 예측. 정확도·학습자료는 이 사이트에서 검증하지 않음` : context.forecastRequested ? '예측 JSON이 없거나 아직 검증되지 않았습니다. 실행 시 검증합니다.' : '시작 시 상태에 정책을 적용하고 단가 고정');
+    if (context.forecastInfo) for (const [key, label] of [['forecastUtilizationA','A 예측 이용률'], ['forecastUtilizationB','B 예측 이용률']])
+      add(label, `${context[key] * 100}%`, '추정값', context.forecastInfo);
+    return rows;
+  }
+  return { defaults, policies, demo, rng, status, price, probability, validate, population, runPolicy, compare, forecast, sweep, sweepKeys, evidence };
 });
