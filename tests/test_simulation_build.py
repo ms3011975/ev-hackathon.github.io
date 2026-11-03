@@ -11,7 +11,8 @@ def test_simulation_assets_embedded_and_monitor_preserved():
     for marker in ('/*__SIM_', '/*__GEO__*/', '/*__PRICES__*/'):
         assert marker not in html
     for element in ('id="map"', 'id="regions"', 'id="ptable"', 'id="simulation-view"',
-                    'window.ESSMonitor', 'ESSimulation', 'sim-form', '결과 CSV 다운로드'):
+                    'window.ESSMonitor', 'ESSimulation', 'ESSReport', 'sim-form', '결과 CSV 다운로드',
+                    '분석 리포트 HTML 다운로드', '부하 시계열 CSV 다운로드', 'example_only'):
         assert element in html
     assert html.startswith('<!doctype html>')
     assert html.endswith('</html>\n')

@@ -47,6 +47,7 @@ def build() -> str:
             .replace("/*__SIM_CONFIG__*/", sim_config)
             .replace("/*__SIM_CSS__*/", (TEMPLATE.parent / "simulation.css").read_text(encoding="utf-8"))
             .replace("/*__SIM_ENGINE__*/", (TEMPLATE.parent / "simulation.js").read_text(encoding="utf-8"))
+            .replace("/*__SIM_REPORT__*/", (TEMPLATE.parent / "simulation-report.js").read_text(encoding="utf-8"))
             .replace("/*__SIM_UI__*/", (TEMPLATE.parent / "simulation-ui.js").read_text(encoding="utf-8")))
     head, rest = body.split("\n<header", 1)
     return ('<!doctype html>\n<html lang="ko">\n<head>\n<meta charset="utf-8">\n'

@@ -3,6 +3,87 @@ const assert = require('node:assert/strict');
 const sim = require('../web/simulation.js');
 const fs = require('node:fs');
 const vm = require('node:vm');
+const report = require('../web/simulation-report.js');
+
+test('15-minute load conserves energy with partial bins and uses coincident aggregate peaks', () => {
+  const stations = sim.demo(), o = {...sim.defaults,minutes:45,energy:15};
+  const profile = sim.loadProfile(stations,o,[[],[]],[
+    {station:0,start:0,end:15},{station:1,start:15,end:30}
+  ]);
+  assert.deepEqual(profile.stationPeakKw,[60,60]);
+  assert.equal(profile.combinedPeakKw,60);
+  assert.equal(profile.newEnergyKwh,30);
+  assert.equal(profile.series.reduce((s,v)=>s+(v[0]+v[1])*.25,0),30);
+  const partial = sim.loadProfile(stations,{...o,energy:30},[[],[]],[{station:0,start:7,end:37}]);
+  assert.deepEqual(partial.series,[[32,0],[60,0],[28,0]]);
+  assert.equal(partial.series.reduce((s,v)=>s+v[0]*.25,0),30);
+});
+
+test('load includes initial residual energy and all deferred charging past the arrival horizon', () => {
+  const stations = sim.demo();
+  const profile = sim.loadProfile(stations,{...sim.defaults,minutes:30},[[20],[]],[{station:0,start:20,end:50}]);
+  assert.equal(profile.initialEnergyKwh,20);
+  assert.equal(profile.newEnergyKwh,30);
+  assert.equal(profile.tailEnergyKwh,20);
+  assert.equal(profile.unfinishedAtHorizon,1);
+  assert.equal(profile.series.reduce((s,v)=>s+v[0]*.25,0),50);
+  assert.equal(profile.stationEnergyKwh[0],50);
+});
+
+test('inconsistent assumed durations flag implied power above rating without losing energy', () => {
+  const profile = sim.loadProfile(sim.demo(),sim.defaults,[[],[]],[{station:0,start:0,end:20}]);
+  assert.equal(profile.overRatedSessions,1);
+  assert.equal(profile.stationPeakKw[0],90);
+  assert.equal(profile.series.reduce((s,v)=>s+v[0]*.25,0),30);
+  const empty = sim.loadProfile(sim.demo(),sim.defaults,[[],[]],[]);
+  assert.equal(empty.combinedPeakKw,0);
+  assert.equal(empty.tailEnergyKwh,0);
+  assert.equal(empty.utilizationGapPp,0);
+  assert.equal(sim.loadProfile(sim.demo(),sim.defaults,[[],[]],[{station:0,start:0,end:400000}]).available,false);
+});
+
+test('reported peak is mean of repetition peaks, not maximum of mean curve', async () => {
+  const stations = sim.demo().map(s=>({...s,avail:1,charging:0}));
+  const populations = [0,15].map(arrival=>({initial:[[],[]],drivers:[{id:0,arrival,duration:30,choice:0}]}));
+  const {results} = await sim.compare(stations,{drivers:1,energy:15,minutes:30,repeats:2,durationMode:'power'},()=>{},undefined,{populations});
+  for (const r of results) {
+    assert.equal(r.load.combinedPeakKw,60);
+    assert.equal(Math.max(...r.load.series.map(v=>v[0]+v[1])),30);
+    assert.equal(r.load.peakSE,0);
+    assert.equal(r.load.peakDeltaSE,0);
+    assert.equal(r.load.combinedPeakReductionPct,0);
+  }
+});
+
+test('repeated policy loads preserve demand, rating and zero-policy equivalence', async () => {
+  const {results,options:o} = await sim.compare(sim.demo(),{repeats:7,durationMode:'power',discount:0,surcharge:0});
+  for (const r of results) {
+    assert.deepEqual(r.load,results[0].load);
+    assert.ok(Math.abs(r.load.newEnergyKwh-o.drivers*o.energy)<1e-9);
+    assert.ok(Math.abs(r.load.series.reduce((s,v)=>s+(v[0]+v[1])*.25,0)-r.load.newEnergyKwh-r.load.initialEnergyKwh)<1e-8);
+    assert.equal(r.load.overRatedSessions,0);
+    for (let i=0;i<2;i++) assert.ok(r.load.stationPeakKw[i]<=r.load.capacityKw[i]+1e-8);
+  }
+});
+
+test('shareable report escapes source labels and exports full aligned profiles', async () => {
+  const output = await sim.compare(sim.demo(),{repeats:2,durationMode:'power'});
+  output.context={source:'<script>alert(1)</script>',region:'example',executedAt:'2026-11-03'};
+  output.evidence=[{item:'<img onerror=bad>',value:'x',kind:'가정값',basis:'fixture'}];
+  const html=report.html(output), rows=report.rows(output);
+  assert.ok(html.startsWith('<!doctype html>'));
+  assert.ok(!html.includes('<script>'));
+  assert.ok(html.includes('&lt;script&gt;'));
+  assert.ok(html.includes('합산 피크 저감률'));
+  assert.ok(html.includes('실제 배전망 측정 결과 아님'));
+  const header=rows.findIndex(r=>r[1]==='구간시작_분');
+  assert.equal(rows.length-header-1,Math.max(...output.results.map(r=>r.load.series.length))*3);
+  assert.equal(rows[header+1][1],0);
+});
+
+test('format-only examples cannot be executed as actual AI model outputs', () => {
+  assert.throws(()=>sim.forecast({example_only:true},sim.demo()),/형식 설명용/);
+});
 
 test('sensitivity baseline matches ordinary comparison and does not mutate inputs', async () => {
   const stations = sim.demo(), options = {...sim.defaults,repeats:4}, copy = JSON.stringify({stations,options});

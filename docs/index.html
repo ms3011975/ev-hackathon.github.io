@@ -818,6 +818,7 @@ svg.leaflet-image-layer.leaflet-interactive path {
 .sim-kind{display:inline-block;font-size:10px;font-weight:600;border:1px solid #b9cebf;border-radius:5px;padding:2px 6px;background:#eef5ef;color:#285943;align-self:flex-start}
 .sim-kind[data-kind="가정값"]{background:#fff3df;color:#815400;border-color:#dcc58f}.sim-kind[data-kind="추정값"]{background:#eaf2fa;color:#285982;border-color:#b9ccdf}.sim-kind[data-kind="정책 설정"],.sim-kind[data-kind="실험 설정"]{background:#f1eff7;color:#62517d;border-color:#cec4dd}
 .sim-evidence-table{white-space:normal;min-width:620px}.sim-evidence-table th,.sim-evidence-table td{text-align:left;vertical-align:top;overflow-wrap:anywhere;line-height:1.6}.sim-evidence-table th{min-width:100px}.sim-evidence-table td:nth-child(2){min-width:140px}.sim-evidence-table td:nth-child(3){min-width:90px}
+.sim-load-chart{margin:24px 0}.sim-load-chart figcaption{font-size:14px;font-weight:600}.sim-load-chart svg{display:block;width:100%;height:auto}.sim-load-legend{display:flex;gap:16px;flex-wrap:wrap;font-size:12px}.sim-load-legend span:nth-child(1){color:#536474}.sim-load-legend span:nth-child(2){color:#245d4b}.sim-load-legend span:nth-child(3){color:#a66a17}.sim-report-findings{font-size:13px}
 #sim-sweep-panel .sim-fields{margin-bottom:14px!important}#sim-sweep-cancel{margin-top:12px}#sim-sweep-results h4{font-size:13px;margin:16px 0}.sim-page fieldset:disabled{opacity:.65}
 @media(max-width:1000px){.sim-layout{grid-template-columns:290px minmax(0,1fr)}.sim-charts{grid-template-columns:1fr}.sim-stations{grid-template-columns:1fr}}
 @media(max-width:720px){.sim-page{padding:20px 12px}.sim-layout{grid-template-columns:minmax(0,1fr);gap:8px}.sim-card{padding:17px}.sim-tabs{padding:10px 12px}.sim-tabs button{font-size:12px}.sim-page h2{font-size:23px}.sim-stations{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}}
@@ -1698,6 +1699,7 @@ window.ESSMonitor.ready = detectServer();
     return !usable ? (s.fault ? '불가' : '미확인') : s.avail / usable >= threshold ? '여유' : s.avail > 0 ? '보통' : '혼잡';
   }
   function forecast(payload, stations, now = Date.now()) {
+    if (payload?.example_only) throw new Error('형식 설명용 예시는 실제 모델 예측으로 실행할 수 없습니다. 실제 출력으로 교체하세요.');
     if (!payload || payload.schema_version !== 1 || typeof payload.model_name !== 'string' || !payload.model_name.trim() || !Array.isArray(payload.predictions))
       throw new Error('예측 JSON의 schema_version(1), model_name, predictions를 확인하세요.');
     const timestamp = value => typeof value === 'string' && /(Z|[+-]\d\d:\d\d)$/.test(value) ? Date.parse(value) : NaN;
@@ -1764,11 +1766,68 @@ window.ESSMonitor.ready = detectServer();
     return { initial, drivers };
   }
   const duration = (s, o, assumed) => o.durationMode === 'power' ? o.energy / s.kw * 60 : assumed;
+  // Energy-conserving constant equivalent power, not measured grid demand.
+  // Initial sessions use representative output because their remaining energy is unknown.
+  function loadProfile(stations, o, initial, records) {
+    const intervalMinutes = 15, events = [];
+    initial.forEach((remaining, station) => remaining.forEach(end => {
+      if (end > 0) events.push({ station, start: 0, end, kw: stations[station].kw, initial: true });
+    }));
+    let overRatedSessions = 0;
+    for (const r of records) {
+      const kw = o.energy * 60 / (r.end - r.start);
+      if (kw > stations[r.station].kw * (1 + 1e-9)) overRatedSessions++;
+      events.push({ station: r.station, start: r.start, end: r.end, kw, initial: false });
+    }
+    const lastCompletionMinutes = Math.max(0, ...events.map(e => e.end));
+    const completion = Math.max(o.minutes, lastCompletionMinutes);
+    const bins = Math.max(1, Math.ceil(completion / intervalMinutes));
+    if (bins > 20000) return { available: false, reason: '완료까지의 기간이 길어 부하 집계 한도를 초과했습니다. 충전 출력과 수요 규모를 확인하세요.' };
+    const energy = [new Float64Array(bins), new Float64Array(bins)];
+    const changes = [new Float64Array(bins + 1), new Float64Array(bins + 1)];
+    const capacityKw = stations.map(s => (s.avail + s.charging) * s.kw);
+    const windowEnergy = [0, 0], stationEnergyKwh = [0, 0];
+    let initialEnergyKwh = 0, tailEnergyKwh = 0;
+    for (const e of events) {
+      const total = (e.end - e.start) * e.kw / 60;
+      stationEnergyKwh[e.station] += total;
+      if (e.initial) initialEnergyKwh += total;
+      const within = Math.max(0, Math.min(e.end, o.minutes) - e.start) * e.kw / 60;
+      windowEnergy[e.station] += within;
+      tailEnergyKwh += total - within;
+      const first = Math.floor(e.start / intervalMinutes), last = Math.floor(e.end / intervalMinutes);
+      if (first === last) energy[e.station][first] += total;
+      else {
+        energy[e.station][first] += ((first + 1) * intervalMinutes - e.start) * e.kw / 60;
+        if (last < bins) energy[e.station][last] += (e.end - last * intervalMinutes) * e.kw / 60;
+        changes[e.station][first + 1] += e.kw;
+        changes[e.station][last] -= e.kw;
+      }
+    }
+    const series = [], stationPeakKw = [0, 0], active = [0, 0];
+    let combinedPeakKw = 0;
+    for (let b = 0; b < bins; b++) {
+      const kw = energy.map((a, i) => {
+        active[i] += changes[i][b];
+        return Math.max(0, a[b] * 60 / intervalMinutes + active[i]);
+      });
+      for (let i = 0; i < 2; i++) stationPeakKw[i] = Math.max(stationPeakKw[i], kw[i]);
+      combinedPeakKw = Math.max(combinedPeakKw, kw[0] + kw[1]);
+      series.push([kw[0], kw[1]]);
+    }
+    const windowUtilization = windowEnergy.map((e, i) => capacityKw[i] > 0 ? e / (capacityKw[i] * o.minutes / 60) : null);
+    return { available: true, intervalMinutes, series, capacityKw, stationPeakKw, combinedPeakKw,
+      stationEnergyKwh, initialEnergyKwh, newEnergyKwh: records.length * o.energy,
+      tailEnergyKwh, unfinishedAtHorizon: records.filter(r => r.end > o.minutes).length,
+      windowUtilization, utilizationGapPp: windowUtilization.every(v => v !== null) ? Math.abs(windowUtilization[0] - windowUtilization[1]) * 100 : null,
+      overRatedSessions, lastCompletionMinutes };
+  }
   function runPolicy(stations, o, people, policy, utilizationById) {
     const prices = stations.map(s => price(s, policy, o, utilizationById));
     const queues = stations.map((s, i) => [
       ...Array(s.avail).fill(0), ...people.initial[i].map(u => u * duration(s, o, 30))
     ]);
+    const initial = queues.map(q => q.filter(t => t > 0));
     const records = [], count = [0, 0];
     let wait = 0, estimated = 0, charge = 0, distance = 0, discount = 0, completion = 0;
     for (const d of people.drivers) {
@@ -1787,19 +1846,43 @@ window.ESSMonitor.ready = detectServer();
     }
     return { policy, prices, count, share: count.map(n => n / o.drivers), wait: wait / o.drivers,
       expectedWait: estimated / o.drivers, fee: charge / o.drivers, distance: distance / o.drivers,
-      discount, revenue: charge, completion, records };
+      discount, revenue: charge, completion, records, load: loadProfile(stations, o, initial, records) };
   }
   async function compare(stations, options = {}, onProgress = () => {}, utilizationById, control = {}) {
     const o = { ...defaults, ...options }; validate(stations, o);
     const random = rng(o.seed), results = policies.map((label, policy) => ({ label, policy, count: [0, 0], share: [0, 0], wait: 0, expectedWait: 0, fee: 0, distance: 0, discount: 0, revenue: 0, completion: 0, samples: [] }));
+    const peakSamples = policies.map(() => []), peakDeltaSamples = policies.map(() => []);
     for (let r = 0; r < o.repeats; r++) {
       if (control.cancelled?.()) throw new Error('분석을 중단했습니다.');
       const people = control.populations ? control.populations[r] : population(stations, o, random);
+      let referencePeak = null;
       for (let p = 0; p < 3; p++) {
         const run = runPolicy(stations, o, people, p, utilizationById), out = results[p];
         for (const key of ['wait', 'expectedWait', 'fee', 'distance', 'discount', 'revenue', 'completion']) out[key] += run[key] / o.repeats;
         for (let i = 0; i < 2; i++) { out.count[i] += run.count[i] / o.repeats; out.share[i] += run.share[i] / o.repeats; }
         out.samples.push(run.wait); out.prices = run.prices;
+        const l = run.load;
+        if (!l.available) out.load = l;
+        else if (out.load?.available !== false) {
+          if (!out.load) out.load = { available: true, intervalMinutes: l.intervalMinutes, capacityKw: l.capacityKw,
+            stationPeakKw: [0, 0], stationEnergyKwh: [0, 0], windowUtilization: l.windowUtilization.map(v => v === null ? null : 0),
+            combinedPeakKw: 0, initialEnergyKwh: 0, newEnergyKwh: 0, tailEnergyKwh: 0, unfinishedAtHorizon: 0,
+            overRatedSessions: 0, lastCompletionMinutes: 0, utilizationGapPp: l.utilizationGapPp === null ? null : 0, series: [] };
+          for (const key of ['combinedPeakKw','initialEnergyKwh','newEnergyKwh','tailEnergyKwh','unfinishedAtHorizon','overRatedSessions','lastCompletionMinutes']) out.load[key] += l[key] / o.repeats;
+          if (l.utilizationGapPp !== null) out.load.utilizationGapPp += l.utilizationGapPp / o.repeats;
+          for (let i = 0; i < 2; i++) {
+            out.load.stationPeakKw[i] += l.stationPeakKw[i] / o.repeats;
+            out.load.stationEnergyKwh[i] += l.stationEnergyKwh[i] / o.repeats;
+            if (l.windowUtilization[i] !== null) out.load.windowUtilization[i] += l.windowUtilization[i] / o.repeats;
+          }
+          l.series.forEach((kw, b) => {
+            if (!out.load.series[b]) out.load.series[b] = [0, 0];
+            for (let i = 0; i < 2; i++) out.load.series[b][i] += kw[i] / o.repeats;
+          });
+          peakSamples[p].push(l.combinedPeakKw);
+          if (p === 0) referencePeak = l.combinedPeakKw;
+          if (referencePeak !== null) peakDeltaSamples[p].push(l.combinedPeakKw - referencePeak);
+        }
         if (!r) out.records = run.records;
       }
       if (r % 10 === 0) { onProgress((r + 1) / o.repeats); await new Promise(resolve => setTimeout(resolve, 0)); }
@@ -1810,6 +1893,18 @@ window.ESSMonitor.ready = detectServer();
       const variance = o.repeats > 1 ? out.samples.reduce((s, x) => s + (x - out.wait) ** 2, 0) / (o.repeats - 1) : 0;
       out.waitSE = o.repeats > 1 ? Math.sqrt(variance / o.repeats) : null;
       delete out.samples;
+    }
+    const se = values => {
+      if (values.length < 2) return null;
+      const mean = values.reduce((a, b) => a + b, 0) / values.length;
+      return Math.sqrt(values.reduce((s, v) => s + (v - mean) ** 2, 0) / (values.length - 1) / values.length);
+    };
+    for (const out of results) if (out.load.available && results[0].load.available) {
+      const baseline = results[0].load;
+      out.load.combinedPeakDeltaKw = out.load.combinedPeakKw - baseline.combinedPeakKw;
+      out.load.combinedPeakReductionPct = baseline.combinedPeakKw > 1e-9 ? (baseline.combinedPeakKw - out.load.combinedPeakKw) / baseline.combinedPeakKw * 100 : null;
+      out.load.stationPeakReductionPct = out.load.stationPeakKw.map((p, i) => baseline.stationPeakKw[i] > 1e-9 ? (baseline.stationPeakKw[i] - p) / baseline.stationPeakKw[i] * 100 : null);
+      out.load.peakSE = se(peakSamples[out.policy]); out.load.peakDeltaSE = se(peakDeltaSamples[out.policy]);
     }
     onProgress(1); return { options: o, stations: stations.map(s => ({ ...s })), results };
   }
@@ -1871,7 +1966,100 @@ window.ESSMonitor.ready = detectServer();
       add(label, `${context[key] * 100}%`, '추정값', context.forecastInfo);
     return rows;
   }
-  return { defaults, policies, demo, rng, status, price, probability, validate, population, runPolicy, compare, forecast, sweep, sweepKeys, evidence };
+  return { defaults, policies, demo, rng, status, price, probability, validate, population, runPolicy, loadProfile, compare, forecast, sweep, sweepKeys, evidence };
+});
+</script>
+<script>/* Shared browser/Node report rendering. All external labels are escaped. */
+(function (root, factory) {
+  if (typeof module === 'object' && module.exports) module.exports = factory();
+  else root.ESSReport = factory();
+})(typeof globalThis !== 'undefined' ? globalThis : this, function () {
+  'use strict';
+  const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+  const fmt = (n, d = 2) => Number.isFinite(n) ? n.toLocaleString('ko-KR', { maximumFractionDigits: d, minimumFractionDigits: d }) : '산정 불가';
+  const total = values => values.reduce((a, b) => a + b, 0);
+  const metrics = [
+    ['A 피크 (kW)', r => r.load.stationPeakKw[0]],
+    ['B 피크 (kW)', r => r.load.stationPeakKw[1]],
+    ['A+B 합산 피크 (kW)', r => r.load.combinedPeakKw],
+    ['합산 피크 SE (kW)', r => r.load.peakSE],
+    ['고정 대비 합산 피크 차이 (kW)', r => r.load.combinedPeakDeltaKw],
+    ['합산 피크 차이 SE (kW)', r => r.load.peakDeltaSE],
+    ['A 피크 저감률 (%)', r => r.load.stationPeakReductionPct[0]],
+    ['B 피크 저감률 (%)', r => r.load.stationPeakReductionPct[1]],
+    ['합산 피크 저감률 (%)', r => r.load.combinedPeakReductionPct],
+    ['도착 기간 내 A/B 평균 부하율 차이 (%p)', r => r.load.utilizationGapPp],
+    ['신규 차량 총 충전량 (kWh)', r => r.load.newEnergyKwh],
+    ['초기 차량 잔여 충전량 추정 (kWh)', r => r.load.initialEnergyKwh],
+    ['완료까지 총 충전량 (kWh)', r => total(r.load.stationEnergyKwh)],
+    ['도착 기간 이후 공급되는 충전량 (kWh)', r => r.load.tailEnergyKwh],
+    ['도착 기간 종료 시 미완료 신규 차량 (명)', r => r.load.unfinishedAtHorizon],
+    ['초기·신규 차량 최종 완료 (시작 후 분)', r => r.load.lastCompletionMinutes],
+    ['대표 출력 초과 등가 전력의 신규 차량 (명)', r => r.load.overRatedSessions],
+    ['평균 실제 대기 (분)', r => r.wait],
+    ['평균 추가 거리 (km/명)', r => r.distance],
+    ['평균 충전비 (원/명)', r => r.fee],
+    ['총 할인 혜택 (원)', r => r.discount],
+    ['고정 대비 단순 매출 차이 (원)', r => r.revenueChange]
+  ];
+  const valid = result => result.results.every(r => r.load?.available);
+  function chart(result, station) {
+    const n = Math.max(...result.results.map(r => r.load.series.length)), stride = Math.max(1, Math.ceil(n / 240));
+    const count = Math.ceil(n / stride), x = i => 48 + i / count * 570;
+    const curves = result.results.map(r => Array.from({ length: count }, (_, b) => {
+      let value = 0;
+      for (let j = b * stride; j < Math.min(n, (b + 1) * stride); j++) {
+        const kw = r.load.series[j] || [0, 0]; value += station === 2 ? total(kw) : kw[station];
+      }
+      return value / Math.min(stride, n - b * stride);
+    }));
+    const max = Math.max(1, ...curves.flat()), y = v => 178 - v / max * 140;
+    const colors = ['#536474', '#245d4b', '#a66a17'];
+    const title = station === 2 ? 'A+B 합산 부하' : `${station ? 'B' : 'A'} 충전소 부하`;
+    return `<figure class="sim-load-chart"><figcaption>${title} · 반복 평균 곡선</figcaption>
+      <svg viewBox="0 0 640 220" role="img" aria-label="${title}, 세 정책의 시간별 평균 부하 비교">
+        ${[0, .5, 1].map(t => `<line x1="48" x2="618" y1="${y(max*t)}" y2="${y(max*t)}" stroke="#d7e2db"/><text x="42" y="${y(max*t)+4}" text-anchor="end" font-size="11" fill="#40554a">${fmt(max*t,0)}</text>`).join('')}
+        <text x="48" y="22" font-size="12" fill="#40554a">kW</text>
+        ${curves.map((values, p) => `<path d="${values.map((v,b) => `${b ? 'L' : 'M'}${x(b).toFixed(2)},${y(v).toFixed(2)} L${x(b+1).toFixed(2)},${y(v).toFixed(2)}`).join(' ')}" fill="none" stroke="${colors[p]}" stroke-width="2" ${p === 2 ? 'stroke-dasharray="5 3"' : ''}/>`).join('')}
+        <text x="48" y="201" font-size="11" fill="#40554a">0분</text><text x="618" y="201" text-anchor="end" font-size="11" fill="#40554a">${n*15}분</text>
+      </svg><p class="sim-note">시작 상태를 0분으로 둔 상대 시각 · ${stride === 1 ? '15분 평균' : `${stride*15}분 묶음 평균 (원본 15분 값은 CSV)`}</p></figure>`;
+  }
+  function render(result) {
+    if (!valid(result)) return `<h3>충전 부하 집중 변화 리포트</h3><p>${esc(result.results.find(r=>!r.load?.available)?.load?.reason || '부하 집계를 사용할 수 없습니다.')}</p>`;
+    const { results, options: o, context: c = {} } = result;
+    const overRated = results.some(r=>r.load.overRatedSessions > 0);
+    const evidence = result.evidence || [];
+    return `<h3>충전 부하 집중 변화 리포트</h3>
+      <p class="sim-note">가정 기반 시뮬레이션 · 15분 평균 등가 충전 부하 · 실제 배전망 측정 결과 아님</p>
+      <p>${esc(c.source)} · ${esc(c.region)}<br>실행 시각: ${esc(c.executedAt || '기록 없음')}<br>요금 근거: ${esc(c.pricingBasis)} ${esc(c.forecastInfo)}<br>A: ${esc(result.stations[0].name)} (${esc(result.stations[0].id)}) / B: ${esc(result.stations[1].name)} (${esc(result.stations[1].id)})<br>신규 ${o.drivers}명 · 도착 ${o.minutes}분 · 차량당 ${o.energy}kWh · ${o.repeats}회 · 시드 ${o.seed}</p>
+      ${overRated ? '<p class="sim-status" data-error="true">충전량과 가정 충전시간으로 계산한 등가 전력이 대표 출력을 넘는 차량이 있습니다. 현재 결과는 에너지 보존 시나리오이며 물리적으로 가능한 부하로 해석할 수 없습니다. 신규 차량 충전시간을 ‘충전량 ÷ 대표 출력’으로 바꾸어 다시 실행하세요.</p>' : '<p class="sim-note">신규 차량은 충전량÷소요시간의 일정 전력, 초기 차량은 대표 출력×가정 잔여시간으로 계산합니다. 실제 충전곡선·효율·출력 공유·비충전 부하는 제외합니다.</p>'}
+      <div class="sim-table-wrap"><table class="sim-table"><caption>각 반복에서 지표를 계산한 뒤 평균 · 피크 저감률은 양수=감소, 음수=증가</caption><thead><tr><th>지표</th>${results.map(r=>`<th>${esc(r.label)}</th>`).join('')}</tr></thead><tbody>${metrics.map(([label,get])=>`<tr><th scope="row">${label}</th>${results.map(r=>`<td>${fmt(get(r))}</td>`).join('')}</tr>`).join('')}</tbody></table></div>
+      <div class="sim-report-findings">${results.slice(1).map(r=>`<p><strong>${esc(r.label)}</strong>: 고정요금 대비 A 피크 저감률 ${fmt(r.load.stationPeakReductionPct[0])}%, B ${fmt(r.load.stationPeakReductionPct[1])}%, 합산 ${fmt(r.load.combinedPeakReductionPct)}%. 합산 피크 차이는 ${fmt(r.load.combinedPeakDeltaKw)}kW이고, 평균 대기 차이는 ${fmt(r.wait-results[0].wait)}분입니다.</p>`).join('')}</div>
+      <p class="sim-note">A의 피크가 줄어도 B 또는 합산 피크는 증가할 수 있습니다. 합산 피크는 같은 시각의 A+B 곡선에서 계산하며 A 피크+B 피크를 더하지 않습니다. SE는 반복 난수에 따른 표준오차이며 모델·행동 가정·미래 예측의 불확실성을 포함하지 않습니다.</p>
+      <p class="sim-load-legend"><span>━ 고정요금</span><span>━ 할인·할증</span><span>┄ 할인 전용</span></p>
+      ${[0,1,2].map(i=>chart(result,i)).join('')}
+      <p class="sim-note">곡선은 반복 평균입니다. 표는 반복별 최대값의 평균이므로 곡선의 최대값과 다를 수 있습니다. 모든 정책의 신규 충전 필요량과 초기 상태는 같습니다. 도착 종료 후에도 모든 차량이 완료될 때까지 계산하며, 부하율 차이는 동일한 도착 생성 기간에서 충전소별 처리 가능 대표 용량으로 나눈 평균 부하율의 절댓값 차이입니다. 이것만으로 변압기·배전선로 피크 저감을 입증하지 않습니다.</p>
+      <details><summary>입력값과 근거</summary><div class="sim-table-wrap"><table class="sim-table sim-evidence-table"><thead><tr><th>항목</th><th>값</th><th>구분</th><th>근거와 한계</th></tr></thead><tbody>${evidence.map(r=>`<tr><th>${esc(r.item)}</th><td>${esc(r.value)}</td><td>${esc(r.kind)}</td><td>${esc(r.basis)}</td></tr>`).join('')}</tbody></table></div></details>`;
+  }
+  const styles = `body{font:15px/1.7 system-ui,sans-serif;color:#213b31;max-width:1100px;padding:28px;margin:auto}h1{font-size:25px}h3{font-size:20px}p{overflow-wrap:anywhere}.sim-table-wrap{overflow-x:auto}.sim-table{border-collapse:collapse;width:100%;font-size:13px;white-space:nowrap}.sim-table th,.sim-table td{padding:10px;border:1px solid #d7e2db;text-align:right}.sim-table th:first-child{text-align:left}.sim-table caption{text-align:left;padding:12px 0}.sim-table thead{background:#eef5ef}.sim-evidence-table{white-space:normal}.sim-evidence-table td{text-align:left}.sim-note{font-size:12px;color:#53695d}.sim-status{padding:12px;background:#fff0e9}.sim-load-chart{margin:22px 0}.sim-load-chart svg{display:block;width:100%;max-height:300px}.sim-load-legend{display:flex;gap:20px;flex-wrap:wrap}.sim-load-legend span:nth-child(1){color:#536474}.sim-load-legend span:nth-child(2){color:#245d4b}.sim-load-legend span:nth-child(3){color:#a66a17}@media print{body{padding:0;font-size:11px}.sim-load-chart, tr{break-inside:avoid}details{display:block}details>div{display:block!important}.sim-table{font-size:9px;white-space:normal}}`;
+  function html(result) {
+    return `<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ESSential 충전 부하 분석 리포트</title><style>${styles}</style></head><body><h1>ESSential 요금 정책 분석</h1>${render(result)}</body></html>`;
+  }
+  function rows(result) {
+    if (!valid(result)) return [];
+    const n = Math.max(...result.results.map(r=>r.load.series.length));
+    const output = [['분석 구분','가정 기반 15분 평균 등가 충전 부하. 실제 배전망 측정 아님'],
+      ...Object.entries(result.context || {}), ...Object.entries(result.options),
+      ...result.stations.flatMap((s,i)=>Object.entries(s).map(([k,v])=>[`${i?'B':'A'}_${k}`,v])), [],
+      ['입력 근거','값','구분','근거와 한계'],...(result.evidence || []).map(r=>[r.item,r.value,r.kind,r.basis]),[],
+      ['지표',...result.results.map(r=>r.label)],...metrics.map(([label,get])=>[label,...result.results.map(get)]),[],
+      ['정책','구간시작_분','구간종료_분','A평균부하_kW','B평균부하_kW','합산평균부하_kW']];
+    for (const r of result.results) for (let b=0;b<n;b++) {
+      const kw = r.load.series[b] || [0,0]; output.push([r.label,b*15,(b+1)*15,...kw,total(kw)]);
+    }
+    return output;
+  }
+  return { render, html, rows };
 });
 </script>
 <script>(function () {
@@ -1922,8 +2110,19 @@ window.ESSMonitor.ready = detectServer();
     </form><div>
       <div class="sim-card"><h3>02 · 비교할 두 충전소</h3><span class="sim-badge" id="sim-source"></span><div id="sim-message" class="sim-status" role="status" aria-live="polite"></div><div id="sim-stations" class="sim-stations"></div></div>
       <details class="sim-card" id="sim-evidence-box"><summary>입력값의 근거 · 실측값 / 추정값 / 가정값</summary><p class="sim-note">실측·수집값은 수집 시각의 기록입니다. 추정값은 계산·대체 단가·대표 출력·외부 예측을 뜻하며 통계 보정을 완료했다는 뜻은 아닙니다. 가정값은 검증 전 시나리오입니다. 공시요금·정책·반복 설정도 별도로 구분합니다.</p><div id="sim-evidence"></div></details>
+      <details class="sim-card"><summary>AI 모델 출력 예시와 연결 범위</summary>
+        <p>현재 연결은 충전소 ID·급속/완속·예측 이용률(0~1), 모델명, 생성 시각, 예측 대상 시각을 받는 버전 1입니다. 이용률은 요금 판정에만 적용합니다.</p>
+        <p>예: A 이용률 0.8, B 0.2. 이 수치는 형식 설명용이며 실제 예측이 아닙니다. 예시 파일은 example_only=true로 표시하여 실제 모델 출력으로 실행하지 못하게 합니다.</p>
+        <button type="button" id="sim-example-output">현재 A/B의 출력 형식 예시 JSON 다운로드</button>
+        <p>후속 버전 2 계약안은 15분 구간 시작·종료, 기준 이용률, 예상 신규 도착 건수를 추가합니다. 건별 이력이 있으면 건당 충전량·소요시간도 보완할 수 있습니다. 버전 2 자동 적용은 아직 지원하지 않습니다.</p>
+        <p><a href="https://github.com/ms3011975/ev-hackathon.github.io/blob/main/docs/simulation-report.md" target="_blank" rel="noopener">팀 공유용 출력 JSON 예시와 분석 리포트 설명</a></p>
+      </details>
       <progress id="sim-progress" max="1" value="0" hidden aria-label="시뮬레이션 진행률"></progress>
       <div id="sim-results" aria-live="polite"><div class="sim-card"><h3>03 · 정책 비교</h3><p class="sim-note">기본 예시 조건으로 바로 실행할 수 있습니다. 결과는 실제 수요 분산 실적 또는 배전망 피크 저감 성과가 아닙니다.</p></div></div>
+      <section id="sim-load-report" class="sim-card" aria-label="충전 부하 분석 리포트" hidden>
+        <p id="sim-load-state" class="sim-note" role="status"></p><div id="sim-load-content"></div>
+        <div class="sim-actions"><button type="button" id="sim-report-export">분석 리포트 HTML 다운로드</button><button type="button" id="sim-load-export">부하 시계열 CSV 다운로드</button></div>
+      </section>
       <section class="sim-card" id="sim-sweep-panel" aria-label="민감도 분석">
         <h3>04 · 가정값을 바꿔 보는 민감도 분석</h3>
         <p class="sim-note">현재 A/B와 조건을 고정하고 한 항목만 바꿉니다. 실측 보정이나 최적 정책 인증이 아닌 시나리오 비교입니다. 현재 기준값은 자동 포함합니다.</p>
@@ -1950,6 +2149,8 @@ window.ESSMonitor.ready = detectServer();
   function selected() { return [$('sim-a').value, $('sim-b').value].map(id => pool.find(s => s.id === id)); }
   function invalidate() {
     if (last) $('sim-export').disabled = true;
+    for (const id of ['sim-report-export','sim-load-export']) $(id).disabled = true;
+    if (last) $('sim-load-state').textContent = '조건이 변경되었습니다. 이전 실행 리포트입니다. 다시 실행하세요.';
     $('sim-results').dataset.stale = 'true';
     if (last) $('sim-result-state').textContent = '조건이 변경되었습니다. 아래는 이전 실행 결과입니다. 다시 실행해 주세요.';
     if (lastSweep) { $('sim-sweep-export').disabled = true; $('sim-sweep-state').textContent = '조건이 변경되었습니다. 아래는 이전 분석 결과입니다. 다시 분석해 주세요.'; }
@@ -2019,7 +2220,7 @@ window.ESSMonitor.ready = detectServer();
     return o;
   }
   function context(prediction) {
-    return { source, region: $('sim-mode').value === 'demo' ? '예시 · 지역 무관' : $('sim-region').selectedOptions[0].text,
+    return { source, executedAt: new Date().toISOString(), region: $('sim-mode').value === 'demo' ? '예시 · 지역 무관' : $('sim-region').selectedOptions[0].text,
       mode: $('sim-mode').value, speed: $('sim-speed').value, distanceMode: $('sim-distanceMode').value,
       forecastRequested: $('sim-pricingBasis').value === 'forecast',
       pricingBasis: $('sim-pricingBasis').value === 'forecast' ? '외부 모델의 예측 이용률 (요금에만 적용)' : '현재 수집 상태',
@@ -2059,6 +2260,11 @@ window.ESSMonitor.ready = detectServer();
       <div class="sim-card"><h3>평균 실제 대기시간</h3>${results.map(r => bar(r, r.wait, maxWait, '분')).join('')}</div></div>
       <div class="sim-card"><h3>이용자 총 할인 혜택</h3>${results.map(r => bar(r, r.discount, maxDiscount, '원')).join('')}<p class="sim-note">기본 단가 대비 할인 혜택의 합입니다. 사업자의 순손실을 의미하지 않습니다. 할증에 따른 추가 부담은 할인액에서 차감하지 않습니다.</p></div>`;
     $('sim-export').addEventListener('click', exportCSV);
+    $('sim-load-report').hidden = false;
+    $('sim-load-state').textContent = '이번 실행의 설정과 반복 결과로 생성했습니다.';
+    $('sim-load-content').innerHTML = window.ESSReport.render(result);
+    const available = results.every(r=>r.load.available);
+    $('sim-report-export').disabled = !available; $('sim-load-export').disabled = !available;
   }
   function exportCSV() {
     if (!last || $('sim-export').disabled) return;
@@ -2072,9 +2278,25 @@ window.ESSMonitor.ready = detectServer();
   }
   function downloadRows(filename, rows) {
     const cell = value => { const text = String(value ?? ''); return '"' + (/^[=+@-]/.test(text) && !Number.isFinite(Number(text)) ? "'" : '') + text.replace(/"/g, '""') + '"'; };
-    const blob = new Blob(['\ufeff' + rows.map(row => row.map(cell).join(',')).join('\r\n')], { type: 'text/csv;charset=utf-8' });
+    downloadFile(filename, '\ufeff' + rows.map(row => row.map(cell).join(',')).join('\r\n'), 'text/csv;charset=utf-8');
+  }
+  function downloadFile(filename, text, type) {
+    const blob = new Blob([text], { type });
     const url = URL.createObjectURL(blob), a = document.createElement('a'); a.href = url; a.download = filename; a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
+  $('sim-report-export').addEventListener('click', () => {
+    if (last && !$('sim-report-export').disabled) downloadFile(`essential-report-${last.options.seed}.html`, window.ESSReport.html(last), 'text/html;charset=utf-8');
+  });
+  $('sim-load-export').addEventListener('click', () => {
+    if (last && !$('sim-load-export').disabled) downloadRows(`essential-load-${last.options.seed}.csv`, window.ESSReport.rows(last));
+  });
+  $('sim-example-output').addEventListener('click', () => {
+    const now = Date.now(), stations = selected().filter(Boolean);
+    const payload = { schema_version: 1, example_only: true, model_name: 'FORMAT_EXAMPLE_NOT_A_MODEL',
+      generated_at: new Date(now).toISOString(), target_time: new Date(now+3600000).toISOString(),
+      predictions: (stations.length === 2 ? stations : sim.demo()).map((s,i)=>({station_id:s.id,speed:s.speed,utilization:i ? .2 : .8})) };
+    downloadFile('essential-forecast-format-example.json', JSON.stringify(payload,null,2), 'application/json;charset=utf-8');
+  });
   const sweepLabel = key => key === 'durationMode' ? '충전시간 계산 방식' : fields.find(f => f[0] === key)[1];
   const levelLabel = (key, value) => key === 'durationMode' ? value === 'power' ? '출력 기반' : '20~40분 가정' : fmt(policiesFields.has(key) ? value * 100 : value, 3).replace(/\.?0+$/, '');
   function presetSweep() {
@@ -2096,6 +2318,8 @@ window.ESSMonitor.ready = detectServer();
       <p class="sim-status">${stable ? '이 비교 범위에서는 평균 대기 최소 정책 집합이 유지됐습니다.' : '수준에 따라 평균 대기 최소 정책 집합이 달라졌습니다. 가정에 따라 정책 순위가 바뀔 수 있습니다.'} 0.01분 미만 차이는 공동 최소로 표시합니다. 통계적 유의성 판정이나 전역 최적 정책은 아닙니다.</p>
       <div class="sim-table-wrap"><table class="sim-table"><caption>한 항목씩 변경 · 반복 1회당 평균</caption><thead><tr><th>${escape(label)}</th><th>정책</th><th>A / B 선택 (명)</th><th>B 비율 (%)</th><th>대기 (분)</th><th>현재값 대비 대기 차이 (분)</th><th>현재값 대비 B 비율 차이 (%p)</th><th>고정요금 대비 대기 (%)</th><th>요금 (원/명)</th><th>추가 거리 (km/명)</th><th>총 할인 (원)</th><th>수입 차이 (원)</th></tr></thead><tbody>
       ${output.scenarios.map(s => s.results.map(r => `<tr><th scope="row">${escape(levelLabel(output.key,s.value))}${s.value === output.baseline ? ' · 현재값' : ''}</th><td>${r.label}</td><td>${fmt(r.count[0])} / ${fmt(r.count[1])}</td><td>${fmt(r.share[1]*100)}</td><td>${fmt(r.wait,2)}</td><td>${fmt(r.waitDelta,2)}</td><td>${fmt(r.shareBDelta,2)}</td><td>${r.waitChange === null ? '기준 0분' : fmt(r.waitChange)}</td><td>${fmt(r.fee)}</td><td>${fmt(r.distance,3)}</td><td>${fmt(r.discount)}</td><td>${fmt(r.revenueChange)}</td></tr>`).join('')).join('')}</tbody></table></div>
+      <div class="sim-table-wrap"><table class="sim-table"><caption>부하 민감도 · 15분 평균 부하의 반복별 피크 평균</caption><thead><tr><th>${escape(label)}</th><th>정책</th><th>A 피크 (kW)</th><th>B 피크 (kW)</th><th>합산 피크 (kW)</th><th>고정 대비 합산 저감률 (%)</th><th>기간 이후 충전량 (kWh)</th></tr></thead><tbody>${output.scenarios.map(s=>s.results.map(r=>`<tr><th>${escape(levelLabel(output.key,s.value))}</th><td>${r.label}</td><td>${fmt(r.load.stationPeakKw?.[0])}</td><td>${fmt(r.load.stationPeakKw?.[1])}</td><td>${fmt(r.load.combinedPeakKw)}</td><td>${fmt(r.load.combinedPeakReductionPct)}</td><td>${fmt(r.load.tailEnergyKwh)}</td></tr>`).join('')).join('')}</tbody></table></div>
+      <p class="sim-note">저감률은 해당 수준의 고정요금 대비이며 양수는 감소, 음수는 증가입니다. 20~40분 가정의 등가 전력은 대표 출력을 넘을 수 있습니다. 부하 해석에는 출력 기반 모드를 권장합니다. 위 정책 순위 안내는 피크가 아닌 대기시간 기준입니다.</p>
       <div class="sim-charts">${sim.policies.map((label,p) => `<div><h4>${label} · 평균 대기</h4>${output.scenarios.map(s => `<div class="sim-bar-row"><div class="sim-bar-label"><span>${escape(levelLabel(output.key,s.value))}${s.value === output.baseline ? ' (현재값)' : ''}</span><b>${fmt(s.results[p].wait,2)}분</b></div><div class="sim-track"><div class="sim-fill sim-wait" style="width:${s.results[p].wait/maxWait*100}%"></div></div></div>`).join('')}</div>`).join('')}</div>
       <p class="sim-note">각 수준의 ‘고정요금 대비’는 그 수준의 고정요금 정책과 비교합니다. ‘현재값 대비’는 현재 기준값에서의 같은 정책과 비교합니다. 동일 난수·초기 잔여시간을 공유하며 인원 변경 시 기존 운전자를 보존하고 추가 인원만 별도 난수로 생성합니다. 상호작용·실세계 예측오차는 분석하지 않습니다.</p>
       <details><summary>이 분석의 기준 입력 근거</summary>${evidenceTable(output.evidence)}</details>
@@ -2110,6 +2334,8 @@ window.ESSMonitor.ready = detectServer();
       ['수준_내부단위','수준_화면단위','현재값여부','정책','A선택_명','B선택_명','B비율_pct','평균대기_분','대기SE_분','현재값대비대기차이_분','현재값대비B비율차이_pp','고정대비대기변화_pct','평균요금_원','평균거리_km','총할인_원','수입_원','고정대비수입차이_원','A단가','B단가'],
       ...s.scenarios.flatMap(level=>level.results.map(r=>[level.value,levelLabel(s.key,level.value),level.value===s.baseline,r.label,...r.count,r.share[1]*100,r.wait,r.waitSE,r.waitDelta,r.shareBDelta,r.waitChange,r.fee,r.distance,r.discount,r.revenue,r.revenueChange,...r.prices]))];
     for (const level of s.scenarios) rows.push([],['수준별 입력 근거',level.value],['항목','값','구분','근거와 한계'],...level.evidence.map(r=>[r.item,r.value,r.kind,r.basis]));
+    rows.push([],['부하 민감도: 15분 등가 부하. 실제 배전망 실측 아님'],['수준','정책','A피크_kW','B피크_kW','합산피크_kW','고정대비합산저감_pct','기간이후충전량_kWh','대표출력초과신규차량_명']);
+    for (const level of s.scenarios) for (const r of level.results) rows.push([level.value,r.label,...(r.load.stationPeakKw || ['', '']),r.load.combinedPeakKw,r.load.combinedPeakReductionPct,r.load.tailEnergyKwh,r.load.overRatedSessions]);
     downloadRows(`essential-sensitivity-${s.key}-${s.base.seed}.csv`,rows);
   }
   $('sim-sweep-key').addEventListener('change', presetSweep);

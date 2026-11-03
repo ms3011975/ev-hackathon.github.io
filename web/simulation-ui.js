@@ -46,8 +46,19 @@
     </form><div>
       <div class="sim-card"><h3>02 · 비교할 두 충전소</h3><span class="sim-badge" id="sim-source"></span><div id="sim-message" class="sim-status" role="status" aria-live="polite"></div><div id="sim-stations" class="sim-stations"></div></div>
       <details class="sim-card" id="sim-evidence-box"><summary>입력값의 근거 · 실측값 / 추정값 / 가정값</summary><p class="sim-note">실측·수집값은 수집 시각의 기록입니다. 추정값은 계산·대체 단가·대표 출력·외부 예측을 뜻하며 통계 보정을 완료했다는 뜻은 아닙니다. 가정값은 검증 전 시나리오입니다. 공시요금·정책·반복 설정도 별도로 구분합니다.</p><div id="sim-evidence"></div></details>
+      <details class="sim-card"><summary>AI 모델 출력 예시와 연결 범위</summary>
+        <p>현재 연결은 충전소 ID·급속/완속·예측 이용률(0~1), 모델명, 생성 시각, 예측 대상 시각을 받는 버전 1입니다. 이용률은 요금 판정에만 적용합니다.</p>
+        <p>예: A 이용률 0.8, B 0.2. 이 수치는 형식 설명용이며 실제 예측이 아닙니다. 예시 파일은 example_only=true로 표시하여 실제 모델 출력으로 실행하지 못하게 합니다.</p>
+        <button type="button" id="sim-example-output">현재 A/B의 출력 형식 예시 JSON 다운로드</button>
+        <p>후속 버전 2 계약안은 15분 구간 시작·종료, 기준 이용률, 예상 신규 도착 건수를 추가합니다. 건별 이력이 있으면 건당 충전량·소요시간도 보완할 수 있습니다. 버전 2 자동 적용은 아직 지원하지 않습니다.</p>
+        <p><a href="https://github.com/ms3011975/ev-hackathon.github.io/blob/main/docs/simulation-report.md" target="_blank" rel="noopener">팀 공유용 출력 JSON 예시와 분석 리포트 설명</a></p>
+      </details>
       <progress id="sim-progress" max="1" value="0" hidden aria-label="시뮬레이션 진행률"></progress>
       <div id="sim-results" aria-live="polite"><div class="sim-card"><h3>03 · 정책 비교</h3><p class="sim-note">기본 예시 조건으로 바로 실행할 수 있습니다. 결과는 실제 수요 분산 실적 또는 배전망 피크 저감 성과가 아닙니다.</p></div></div>
+      <section id="sim-load-report" class="sim-card" aria-label="충전 부하 분석 리포트" hidden>
+        <p id="sim-load-state" class="sim-note" role="status"></p><div id="sim-load-content"></div>
+        <div class="sim-actions"><button type="button" id="sim-report-export">분석 리포트 HTML 다운로드</button><button type="button" id="sim-load-export">부하 시계열 CSV 다운로드</button></div>
+      </section>
       <section class="sim-card" id="sim-sweep-panel" aria-label="민감도 분석">
         <h3>04 · 가정값을 바꿔 보는 민감도 분석</h3>
         <p class="sim-note">현재 A/B와 조건을 고정하고 한 항목만 바꿉니다. 실측 보정이나 최적 정책 인증이 아닌 시나리오 비교입니다. 현재 기준값은 자동 포함합니다.</p>
@@ -74,6 +85,8 @@
   function selected() { return [$('sim-a').value, $('sim-b').value].map(id => pool.find(s => s.id === id)); }
   function invalidate() {
     if (last) $('sim-export').disabled = true;
+    for (const id of ['sim-report-export','sim-load-export']) $(id).disabled = true;
+    if (last) $('sim-load-state').textContent = '조건이 변경되었습니다. 이전 실행 리포트입니다. 다시 실행하세요.';
     $('sim-results').dataset.stale = 'true';
     if (last) $('sim-result-state').textContent = '조건이 변경되었습니다. 아래는 이전 실행 결과입니다. 다시 실행해 주세요.';
     if (lastSweep) { $('sim-sweep-export').disabled = true; $('sim-sweep-state').textContent = '조건이 변경되었습니다. 아래는 이전 분석 결과입니다. 다시 분석해 주세요.'; }
@@ -143,7 +156,7 @@
     return o;
   }
   function context(prediction) {
-    return { source, region: $('sim-mode').value === 'demo' ? '예시 · 지역 무관' : $('sim-region').selectedOptions[0].text,
+    return { source, executedAt: new Date().toISOString(), region: $('sim-mode').value === 'demo' ? '예시 · 지역 무관' : $('sim-region').selectedOptions[0].text,
       mode: $('sim-mode').value, speed: $('sim-speed').value, distanceMode: $('sim-distanceMode').value,
       forecastRequested: $('sim-pricingBasis').value === 'forecast',
       pricingBasis: $('sim-pricingBasis').value === 'forecast' ? '외부 모델의 예측 이용률 (요금에만 적용)' : '현재 수집 상태',
@@ -183,6 +196,11 @@
       <div class="sim-card"><h3>평균 실제 대기시간</h3>${results.map(r => bar(r, r.wait, maxWait, '분')).join('')}</div></div>
       <div class="sim-card"><h3>이용자 총 할인 혜택</h3>${results.map(r => bar(r, r.discount, maxDiscount, '원')).join('')}<p class="sim-note">기본 단가 대비 할인 혜택의 합입니다. 사업자의 순손실을 의미하지 않습니다. 할증에 따른 추가 부담은 할인액에서 차감하지 않습니다.</p></div>`;
     $('sim-export').addEventListener('click', exportCSV);
+    $('sim-load-report').hidden = false;
+    $('sim-load-state').textContent = '이번 실행의 설정과 반복 결과로 생성했습니다.';
+    $('sim-load-content').innerHTML = window.ESSReport.render(result);
+    const available = results.every(r=>r.load.available);
+    $('sim-report-export').disabled = !available; $('sim-load-export').disabled = !available;
   }
   function exportCSV() {
     if (!last || $('sim-export').disabled) return;
@@ -196,9 +214,25 @@
   }
   function downloadRows(filename, rows) {
     const cell = value => { const text = String(value ?? ''); return '"' + (/^[=+@-]/.test(text) && !Number.isFinite(Number(text)) ? "'" : '') + text.replace(/"/g, '""') + '"'; };
-    const blob = new Blob(['\ufeff' + rows.map(row => row.map(cell).join(',')).join('\r\n')], { type: 'text/csv;charset=utf-8' });
+    downloadFile(filename, '\ufeff' + rows.map(row => row.map(cell).join(',')).join('\r\n'), 'text/csv;charset=utf-8');
+  }
+  function downloadFile(filename, text, type) {
+    const blob = new Blob([text], { type });
     const url = URL.createObjectURL(blob), a = document.createElement('a'); a.href = url; a.download = filename; a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
+  $('sim-report-export').addEventListener('click', () => {
+    if (last && !$('sim-report-export').disabled) downloadFile(`essential-report-${last.options.seed}.html`, window.ESSReport.html(last), 'text/html;charset=utf-8');
+  });
+  $('sim-load-export').addEventListener('click', () => {
+    if (last && !$('sim-load-export').disabled) downloadRows(`essential-load-${last.options.seed}.csv`, window.ESSReport.rows(last));
+  });
+  $('sim-example-output').addEventListener('click', () => {
+    const now = Date.now(), stations = selected().filter(Boolean);
+    const payload = { schema_version: 1, example_only: true, model_name: 'FORMAT_EXAMPLE_NOT_A_MODEL',
+      generated_at: new Date(now).toISOString(), target_time: new Date(now+3600000).toISOString(),
+      predictions: (stations.length === 2 ? stations : sim.demo()).map((s,i)=>({station_id:s.id,speed:s.speed,utilization:i ? .2 : .8})) };
+    downloadFile('essential-forecast-format-example.json', JSON.stringify(payload,null,2), 'application/json;charset=utf-8');
+  });
   const sweepLabel = key => key === 'durationMode' ? '충전시간 계산 방식' : fields.find(f => f[0] === key)[1];
   const levelLabel = (key, value) => key === 'durationMode' ? value === 'power' ? '출력 기반' : '20~40분 가정' : fmt(policiesFields.has(key) ? value * 100 : value, 3).replace(/\.?0+$/, '');
   function presetSweep() {
@@ -220,6 +254,8 @@
       <p class="sim-status">${stable ? '이 비교 범위에서는 평균 대기 최소 정책 집합이 유지됐습니다.' : '수준에 따라 평균 대기 최소 정책 집합이 달라졌습니다. 가정에 따라 정책 순위가 바뀔 수 있습니다.'} 0.01분 미만 차이는 공동 최소로 표시합니다. 통계적 유의성 판정이나 전역 최적 정책은 아닙니다.</p>
       <div class="sim-table-wrap"><table class="sim-table"><caption>한 항목씩 변경 · 반복 1회당 평균</caption><thead><tr><th>${escape(label)}</th><th>정책</th><th>A / B 선택 (명)</th><th>B 비율 (%)</th><th>대기 (분)</th><th>현재값 대비 대기 차이 (분)</th><th>현재값 대비 B 비율 차이 (%p)</th><th>고정요금 대비 대기 (%)</th><th>요금 (원/명)</th><th>추가 거리 (km/명)</th><th>총 할인 (원)</th><th>수입 차이 (원)</th></tr></thead><tbody>
       ${output.scenarios.map(s => s.results.map(r => `<tr><th scope="row">${escape(levelLabel(output.key,s.value))}${s.value === output.baseline ? ' · 현재값' : ''}</th><td>${r.label}</td><td>${fmt(r.count[0])} / ${fmt(r.count[1])}</td><td>${fmt(r.share[1]*100)}</td><td>${fmt(r.wait,2)}</td><td>${fmt(r.waitDelta,2)}</td><td>${fmt(r.shareBDelta,2)}</td><td>${r.waitChange === null ? '기준 0분' : fmt(r.waitChange)}</td><td>${fmt(r.fee)}</td><td>${fmt(r.distance,3)}</td><td>${fmt(r.discount)}</td><td>${fmt(r.revenueChange)}</td></tr>`).join('')).join('')}</tbody></table></div>
+      <div class="sim-table-wrap"><table class="sim-table"><caption>부하 민감도 · 15분 평균 부하의 반복별 피크 평균</caption><thead><tr><th>${escape(label)}</th><th>정책</th><th>A 피크 (kW)</th><th>B 피크 (kW)</th><th>합산 피크 (kW)</th><th>고정 대비 합산 저감률 (%)</th><th>기간 이후 충전량 (kWh)</th></tr></thead><tbody>${output.scenarios.map(s=>s.results.map(r=>`<tr><th>${escape(levelLabel(output.key,s.value))}</th><td>${r.label}</td><td>${fmt(r.load.stationPeakKw?.[0])}</td><td>${fmt(r.load.stationPeakKw?.[1])}</td><td>${fmt(r.load.combinedPeakKw)}</td><td>${fmt(r.load.combinedPeakReductionPct)}</td><td>${fmt(r.load.tailEnergyKwh)}</td></tr>`).join('')).join('')}</tbody></table></div>
+      <p class="sim-note">저감률은 해당 수준의 고정요금 대비이며 양수는 감소, 음수는 증가입니다. 20~40분 가정의 등가 전력은 대표 출력을 넘을 수 있습니다. 부하 해석에는 출력 기반 모드를 권장합니다. 위 정책 순위 안내는 피크가 아닌 대기시간 기준입니다.</p>
       <div class="sim-charts">${sim.policies.map((label,p) => `<div><h4>${label} · 평균 대기</h4>${output.scenarios.map(s => `<div class="sim-bar-row"><div class="sim-bar-label"><span>${escape(levelLabel(output.key,s.value))}${s.value === output.baseline ? ' (현재값)' : ''}</span><b>${fmt(s.results[p].wait,2)}분</b></div><div class="sim-track"><div class="sim-fill sim-wait" style="width:${s.results[p].wait/maxWait*100}%"></div></div></div>`).join('')}</div>`).join('')}</div>
       <p class="sim-note">각 수준의 ‘고정요금 대비’는 그 수준의 고정요금 정책과 비교합니다. ‘현재값 대비’는 현재 기준값에서의 같은 정책과 비교합니다. 동일 난수·초기 잔여시간을 공유하며 인원 변경 시 기존 운전자를 보존하고 추가 인원만 별도 난수로 생성합니다. 상호작용·실세계 예측오차는 분석하지 않습니다.</p>
       <details><summary>이 분석의 기준 입력 근거</summary>${evidenceTable(output.evidence)}</details>
@@ -234,6 +270,8 @@
       ['수준_내부단위','수준_화면단위','현재값여부','정책','A선택_명','B선택_명','B비율_pct','평균대기_분','대기SE_분','현재값대비대기차이_분','현재값대비B비율차이_pp','고정대비대기변화_pct','평균요금_원','평균거리_km','총할인_원','수입_원','고정대비수입차이_원','A단가','B단가'],
       ...s.scenarios.flatMap(level=>level.results.map(r=>[level.value,levelLabel(s.key,level.value),level.value===s.baseline,r.label,...r.count,r.share[1]*100,r.wait,r.waitSE,r.waitDelta,r.shareBDelta,r.waitChange,r.fee,r.distance,r.discount,r.revenue,r.revenueChange,...r.prices]))];
     for (const level of s.scenarios) rows.push([],['수준별 입력 근거',level.value],['항목','값','구분','근거와 한계'],...level.evidence.map(r=>[r.item,r.value,r.kind,r.basis]));
+    rows.push([],['부하 민감도: 15분 등가 부하. 실제 배전망 실측 아님'],['수준','정책','A피크_kW','B피크_kW','합산피크_kW','고정대비합산저감_pct','기간이후충전량_kWh','대표출력초과신규차량_명']);
+    for (const level of s.scenarios) for (const r of level.results) rows.push([level.value,r.label,...(r.load.stationPeakKw || ['', '']),r.load.combinedPeakKw,r.load.combinedPeakReductionPct,r.load.tailEnergyKwh,r.load.overRatedSessions]);
     downloadRows(`essential-sensitivity-${s.key}-${s.base.seed}.csv`,rows);
   }
   $('sim-sweep-key').addEventListener('change', presetSweep);

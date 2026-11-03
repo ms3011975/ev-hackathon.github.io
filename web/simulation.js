@@ -22,6 +22,7 @@
     return !usable ? (s.fault ? '불가' : '미확인') : s.avail / usable >= threshold ? '여유' : s.avail > 0 ? '보통' : '혼잡';
   }
   function forecast(payload, stations, now = Date.now()) {
+    if (payload?.example_only) throw new Error('형식 설명용 예시는 실제 모델 예측으로 실행할 수 없습니다. 실제 출력으로 교체하세요.');
     if (!payload || payload.schema_version !== 1 || typeof payload.model_name !== 'string' || !payload.model_name.trim() || !Array.isArray(payload.predictions))
       throw new Error('예측 JSON의 schema_version(1), model_name, predictions를 확인하세요.');
     const timestamp = value => typeof value === 'string' && /(Z|[+-]\d\d:\d\d)$/.test(value) ? Date.parse(value) : NaN;
@@ -88,11 +89,68 @@
     return { initial, drivers };
   }
   const duration = (s, o, assumed) => o.durationMode === 'power' ? o.energy / s.kw * 60 : assumed;
+  // Energy-conserving constant equivalent power, not measured grid demand.
+  // Initial sessions use representative output because their remaining energy is unknown.
+  function loadProfile(stations, o, initial, records) {
+    const intervalMinutes = 15, events = [];
+    initial.forEach((remaining, station) => remaining.forEach(end => {
+      if (end > 0) events.push({ station, start: 0, end, kw: stations[station].kw, initial: true });
+    }));
+    let overRatedSessions = 0;
+    for (const r of records) {
+      const kw = o.energy * 60 / (r.end - r.start);
+      if (kw > stations[r.station].kw * (1 + 1e-9)) overRatedSessions++;
+      events.push({ station: r.station, start: r.start, end: r.end, kw, initial: false });
+    }
+    const lastCompletionMinutes = Math.max(0, ...events.map(e => e.end));
+    const completion = Math.max(o.minutes, lastCompletionMinutes);
+    const bins = Math.max(1, Math.ceil(completion / intervalMinutes));
+    if (bins > 20000) return { available: false, reason: '완료까지의 기간이 길어 부하 집계 한도를 초과했습니다. 충전 출력과 수요 규모를 확인하세요.' };
+    const energy = [new Float64Array(bins), new Float64Array(bins)];
+    const changes = [new Float64Array(bins + 1), new Float64Array(bins + 1)];
+    const capacityKw = stations.map(s => (s.avail + s.charging) * s.kw);
+    const windowEnergy = [0, 0], stationEnergyKwh = [0, 0];
+    let initialEnergyKwh = 0, tailEnergyKwh = 0;
+    for (const e of events) {
+      const total = (e.end - e.start) * e.kw / 60;
+      stationEnergyKwh[e.station] += total;
+      if (e.initial) initialEnergyKwh += total;
+      const within = Math.max(0, Math.min(e.end, o.minutes) - e.start) * e.kw / 60;
+      windowEnergy[e.station] += within;
+      tailEnergyKwh += total - within;
+      const first = Math.floor(e.start / intervalMinutes), last = Math.floor(e.end / intervalMinutes);
+      if (first === last) energy[e.station][first] += total;
+      else {
+        energy[e.station][first] += ((first + 1) * intervalMinutes - e.start) * e.kw / 60;
+        if (last < bins) energy[e.station][last] += (e.end - last * intervalMinutes) * e.kw / 60;
+        changes[e.station][first + 1] += e.kw;
+        changes[e.station][last] -= e.kw;
+      }
+    }
+    const series = [], stationPeakKw = [0, 0], active = [0, 0];
+    let combinedPeakKw = 0;
+    for (let b = 0; b < bins; b++) {
+      const kw = energy.map((a, i) => {
+        active[i] += changes[i][b];
+        return Math.max(0, a[b] * 60 / intervalMinutes + active[i]);
+      });
+      for (let i = 0; i < 2; i++) stationPeakKw[i] = Math.max(stationPeakKw[i], kw[i]);
+      combinedPeakKw = Math.max(combinedPeakKw, kw[0] + kw[1]);
+      series.push([kw[0], kw[1]]);
+    }
+    const windowUtilization = windowEnergy.map((e, i) => capacityKw[i] > 0 ? e / (capacityKw[i] * o.minutes / 60) : null);
+    return { available: true, intervalMinutes, series, capacityKw, stationPeakKw, combinedPeakKw,
+      stationEnergyKwh, initialEnergyKwh, newEnergyKwh: records.length * o.energy,
+      tailEnergyKwh, unfinishedAtHorizon: records.filter(r => r.end > o.minutes).length,
+      windowUtilization, utilizationGapPp: windowUtilization.every(v => v !== null) ? Math.abs(windowUtilization[0] - windowUtilization[1]) * 100 : null,
+      overRatedSessions, lastCompletionMinutes };
+  }
   function runPolicy(stations, o, people, policy, utilizationById) {
     const prices = stations.map(s => price(s, policy, o, utilizationById));
     const queues = stations.map((s, i) => [
       ...Array(s.avail).fill(0), ...people.initial[i].map(u => u * duration(s, o, 30))
     ]);
+    const initial = queues.map(q => q.filter(t => t > 0));
     const records = [], count = [0, 0];
     let wait = 0, estimated = 0, charge = 0, distance = 0, discount = 0, completion = 0;
     for (const d of people.drivers) {
@@ -111,19 +169,43 @@
     }
     return { policy, prices, count, share: count.map(n => n / o.drivers), wait: wait / o.drivers,
       expectedWait: estimated / o.drivers, fee: charge / o.drivers, distance: distance / o.drivers,
-      discount, revenue: charge, completion, records };
+      discount, revenue: charge, completion, records, load: loadProfile(stations, o, initial, records) };
   }
   async function compare(stations, options = {}, onProgress = () => {}, utilizationById, control = {}) {
     const o = { ...defaults, ...options }; validate(stations, o);
     const random = rng(o.seed), results = policies.map((label, policy) => ({ label, policy, count: [0, 0], share: [0, 0], wait: 0, expectedWait: 0, fee: 0, distance: 0, discount: 0, revenue: 0, completion: 0, samples: [] }));
+    const peakSamples = policies.map(() => []), peakDeltaSamples = policies.map(() => []);
     for (let r = 0; r < o.repeats; r++) {
       if (control.cancelled?.()) throw new Error('분석을 중단했습니다.');
       const people = control.populations ? control.populations[r] : population(stations, o, random);
+      let referencePeak = null;
       for (let p = 0; p < 3; p++) {
         const run = runPolicy(stations, o, people, p, utilizationById), out = results[p];
         for (const key of ['wait', 'expectedWait', 'fee', 'distance', 'discount', 'revenue', 'completion']) out[key] += run[key] / o.repeats;
         for (let i = 0; i < 2; i++) { out.count[i] += run.count[i] / o.repeats; out.share[i] += run.share[i] / o.repeats; }
         out.samples.push(run.wait); out.prices = run.prices;
+        const l = run.load;
+        if (!l.available) out.load = l;
+        else if (out.load?.available !== false) {
+          if (!out.load) out.load = { available: true, intervalMinutes: l.intervalMinutes, capacityKw: l.capacityKw,
+            stationPeakKw: [0, 0], stationEnergyKwh: [0, 0], windowUtilization: l.windowUtilization.map(v => v === null ? null : 0),
+            combinedPeakKw: 0, initialEnergyKwh: 0, newEnergyKwh: 0, tailEnergyKwh: 0, unfinishedAtHorizon: 0,
+            overRatedSessions: 0, lastCompletionMinutes: 0, utilizationGapPp: l.utilizationGapPp === null ? null : 0, series: [] };
+          for (const key of ['combinedPeakKw','initialEnergyKwh','newEnergyKwh','tailEnergyKwh','unfinishedAtHorizon','overRatedSessions','lastCompletionMinutes']) out.load[key] += l[key] / o.repeats;
+          if (l.utilizationGapPp !== null) out.load.utilizationGapPp += l.utilizationGapPp / o.repeats;
+          for (let i = 0; i < 2; i++) {
+            out.load.stationPeakKw[i] += l.stationPeakKw[i] / o.repeats;
+            out.load.stationEnergyKwh[i] += l.stationEnergyKwh[i] / o.repeats;
+            if (l.windowUtilization[i] !== null) out.load.windowUtilization[i] += l.windowUtilization[i] / o.repeats;
+          }
+          l.series.forEach((kw, b) => {
+            if (!out.load.series[b]) out.load.series[b] = [0, 0];
+            for (let i = 0; i < 2; i++) out.load.series[b][i] += kw[i] / o.repeats;
+          });
+          peakSamples[p].push(l.combinedPeakKw);
+          if (p === 0) referencePeak = l.combinedPeakKw;
+          if (referencePeak !== null) peakDeltaSamples[p].push(l.combinedPeakKw - referencePeak);
+        }
         if (!r) out.records = run.records;
       }
       if (r % 10 === 0) { onProgress((r + 1) / o.repeats); await new Promise(resolve => setTimeout(resolve, 0)); }
@@ -134,6 +216,18 @@
       const variance = o.repeats > 1 ? out.samples.reduce((s, x) => s + (x - out.wait) ** 2, 0) / (o.repeats - 1) : 0;
       out.waitSE = o.repeats > 1 ? Math.sqrt(variance / o.repeats) : null;
       delete out.samples;
+    }
+    const se = values => {
+      if (values.length < 2) return null;
+      const mean = values.reduce((a, b) => a + b, 0) / values.length;
+      return Math.sqrt(values.reduce((s, v) => s + (v - mean) ** 2, 0) / (values.length - 1) / values.length);
+    };
+    for (const out of results) if (out.load.available && results[0].load.available) {
+      const baseline = results[0].load;
+      out.load.combinedPeakDeltaKw = out.load.combinedPeakKw - baseline.combinedPeakKw;
+      out.load.combinedPeakReductionPct = baseline.combinedPeakKw > 1e-9 ? (baseline.combinedPeakKw - out.load.combinedPeakKw) / baseline.combinedPeakKw * 100 : null;
+      out.load.stationPeakReductionPct = out.load.stationPeakKw.map((p, i) => baseline.stationPeakKw[i] > 1e-9 ? (baseline.stationPeakKw[i] - p) / baseline.stationPeakKw[i] * 100 : null);
+      out.load.peakSE = se(peakSamples[out.policy]); out.load.peakDeltaSE = se(peakDeltaSamples[out.policy]);
     }
     onProgress(1); return { options: o, stations: stations.map(s => ({ ...s })), results };
   }
@@ -195,5 +289,5 @@
       add(label, `${context[key] * 100}%`, '추정값', context.forecastInfo);
     return rows;
   }
-  return { defaults, policies, demo, rng, status, price, probability, validate, population, runPolicy, compare, forecast, sweep, sweepKeys, evidence };
+  return { defaults, policies, demo, rng, status, price, probability, validate, population, runPolicy, loadProfile, compare, forecast, sweep, sweepKeys, evidence };
 });
