@@ -819,6 +819,7 @@ svg.leaflet-image-layer.leaflet-interactive path {
 .sim-kind[data-kind="가정값"]{background:#fff3df;color:#815400;border-color:#dcc58f}.sim-kind[data-kind="추정값"]{background:#eaf2fa;color:#285982;border-color:#b9ccdf}.sim-kind[data-kind="정책 설정"],.sim-kind[data-kind="실험 설정"]{background:#f1eff7;color:#62517d;border-color:#cec4dd}
 .sim-evidence-table{white-space:normal;min-width:620px}.sim-evidence-table th,.sim-evidence-table td{text-align:left;vertical-align:top;overflow-wrap:anywhere;line-height:1.6}.sim-evidence-table th{min-width:100px}.sim-evidence-table td:nth-child(2){min-width:140px}.sim-evidence-table td:nth-child(3){min-width:90px}
 .sim-load-chart{margin:24px 0}.sim-load-chart figcaption{font-size:14px;font-weight:600}.sim-load-chart svg{display:block;width:100%;height:auto}.sim-load-legend{display:flex;gap:16px;flex-wrap:wrap;font-size:12px}.sim-load-legend span:nth-child(1){color:#536474}.sim-load-legend span:nth-child(2){color:#245d4b}.sim-load-legend span:nth-child(3){color:#a66a17}.sim-report-findings{font-size:13px}
+.sim-load-legend{margin:10px 0}.sim-load-legend span{display:inline-flex;align-items:center;gap:6px}.sim-load-key{display:inline-block;flex:0 0 22px;width:22px;border-top:3px solid currentColor}
 #sim-sweep-panel .sim-fields{margin-bottom:14px!important}#sim-sweep-cancel{margin-top:12px}#sim-sweep-results h4{font-size:13px;margin:16px 0}.sim-page fieldset:disabled{opacity:.65}
 @media(max-width:1000px){.sim-layout{grid-template-columns:290px minmax(0,1fr)}.sim-charts{grid-template-columns:1fr}.sim-stations{grid-template-columns:1fr}}
 @media(max-width:720px){.sim-page{padding:20px 12px}.sim-layout{grid-template-columns:minmax(0,1fr);gap:8px}.sim-card{padding:17px}.sim-tabs{padding:10px 12px}.sim-tabs button{font-size:12px}.sim-page h2{font-size:23px}.sim-stations{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}}
@@ -1684,7 +1685,7 @@ window.ESSMonitor.ready = detectServer();
   const policies = ['고정요금', '할인·할증', '할인 전용'];
   const defaults = { drivers: 24, minutes: 60, energy: 30, discount: .2, surcharge: .15,
     alpha: 600, beta: 300, tau: 2000, sensitivity: 1, repeats: 100, seed: 42,
-    distance: 2, threshold: .5, durationMode: 'assumed' };
+    distance: 2, threshold: .5, durationMode: 'power' };
   const demo = () => [
     { id: 'DEMO-A', name: '예시 A · 혼잡 거점', lat: 36.6424, lng: 127.489, avail: 0, charging: 4, fault: 0, base: 347.2, kw: 60, speed: 'fast', source: '예시 단가' },
     { id: 'DEMO-B', name: '예시 B · 여유 거점', lat: 36.6604, lng: 127.489, avail: 3, charging: 1, fault: 0, base: 347.2, kw: 60, speed: 'fast', source: '예시 단가' }
@@ -2016,13 +2017,21 @@ window.ESSMonitor.ready = detectServer();
     const max = Math.max(1, ...curves.flat()), y = v => 178 - v / max * 140;
     const colors = ['#536474', '#245d4b', '#a66a17'];
     const title = station === 2 ? 'A+B 합산 부하' : `${station ? 'B' : 'A'} 충전소 부하`;
+    const explanations = [
+      'A에서 세 정책의 부하를 비교합니다. 정책 선이 회색보다 낮으면 그 시간대 A의 부하가 작은 것입니다. 후반부만 낮아졌다면 최대 부하인 피크는 그대로일 수 있습니다. B와 합산 부하도 함께 확인하세요.',
+      'B에서 세 정책의 부하를 비교합니다. A에서 차량이 이동해 오면 B의 부하는 증가할 수 있습니다. B의 증가를 무조건 실패로 해석하지 말고 A의 감소와 합산 피크, 대기시간을 함께 확인하세요.',
+      '같은 시각의 A와 B 부하를 더한 곡선입니다. A 피크와 B 피크를 따로 더한 값이 아닙니다. A가 줄어도 합산 피크는 같거나 증가할 수 있으며, 실제 배전망의 다른 부하는 포함하지 않습니다.'
+    ];
+    const explanationId = `sim-load-explanation-${station}`;
     return `<figure class="sim-load-chart"><figcaption>${title} · 반복 평균 곡선</figcaption>
-      <svg viewBox="0 0 640 220" role="img" aria-label="${title}, 세 정책의 시간별 평균 부하 비교">
+      <div class="sim-load-legend" role="list" aria-label="${title} 정책 색상 범례">${['회색 실선 · 고정요금','녹색 실선 · 할인·할증','주황 점선 · 할인 전용'].map((label,p)=>`<span role="listitem"><i class="sim-load-key" aria-hidden="true"${p === 2 ? ' style="border-top-style:dashed"' : ''}></i>${label}</span>`).join('')}</div>
+      <svg viewBox="0 0 640 220" role="img" aria-label="${title}, 세 정책의 시간별 평균 부하 비교" aria-describedby="${explanationId}">
         ${[0, .5, 1].map(t => `<line x1="48" x2="618" y1="${y(max*t)}" y2="${y(max*t)}" stroke="#d7e2db"/><text x="42" y="${y(max*t)+4}" text-anchor="end" font-size="11" fill="#40554a">${fmt(max*t,0)}</text>`).join('')}
         <text x="48" y="22" font-size="12" fill="#40554a">kW</text>
         ${curves.map((values, p) => `<path d="${values.map((v,b) => `${b ? 'L' : 'M'}${x(b).toFixed(2)},${y(v).toFixed(2)} L${x(b+1).toFixed(2)},${y(v).toFixed(2)}`).join(' ')}" fill="none" stroke="${colors[p]}" stroke-width="2" ${p === 2 ? 'stroke-dasharray="5 3"' : ''}/>`).join('')}
         <text x="48" y="201" font-size="11" fill="#40554a">0분</text><text x="618" y="201" text-anchor="end" font-size="11" fill="#40554a">${n*15}분</text>
-      </svg><p class="sim-note">시작 상태를 0분으로 둔 상대 시각 · ${stride === 1 ? '15분 평균' : `${stride*15}분 묶음 평균 (원본 15분 값은 CSV)`}</p></figure>`;
+      </svg><p class="sim-note">가로축: 시작 후 경과시간(분) · 세로축: ${stride === 1 ? '15분 평균 부하(kW)' : `${stride*15}분 묶음 평균 부하(kW), 원본 15분 값은 CSV`} · 세로 눈금은 자동 범위이며 정격 용량이 아닙니다.</p>
+      <div id="${explanationId}" class="sim-note"><p>${explanations[station]}</p><p>계단은 구간별 평균을 뜻하며, 각 구간은 ${result.options.repeats}회 실행의 평균입니다. 선이 겹치면 정책 결과가 비슷한 것입니다. 표는 반복별 피크의 평균이므로 곡선 최고점과 다를 수 있습니다.</p><p>신규 차량은 시작 후 ${result.options.minutes}분까지만 생성합니다. 이후 대기·충전을 마치며 부하가 0으로 내려갑니다. 표시 종료 시각은 전체 완료 구간을 포함하며 실제 시계 시각이나 이후 수요가 0이라는 예측이 아닙니다.</p></div></figure>`;
   }
   function render(result) {
     if (!valid(result)) return `<h3>충전 부하 집중 변화 리포트</h3><p>${esc(result.results.find(r=>!r.load?.available)?.load?.reason || '부하 집계를 사용할 수 없습니다.')}</p>`;
@@ -2036,14 +2045,14 @@ window.ESSMonitor.ready = detectServer();
       <div class="sim-table-wrap"><table class="sim-table"><caption>각 반복에서 지표를 계산한 뒤 평균 · 피크 저감률은 양수=감소, 음수=증가</caption><thead><tr><th>지표</th>${results.map(r=>`<th>${esc(r.label)}</th>`).join('')}</tr></thead><tbody>${metrics.map(([label,get])=>`<tr><th scope="row">${label}</th>${results.map(r=>`<td>${fmt(get(r))}</td>`).join('')}</tr>`).join('')}</tbody></table></div>
       <div class="sim-report-findings">${results.slice(1).map(r=>`<p><strong>${esc(r.label)}</strong>: 고정요금 대비 A 피크 저감률 ${fmt(r.load.stationPeakReductionPct[0])}%, B ${fmt(r.load.stationPeakReductionPct[1])}%, 합산 ${fmt(r.load.combinedPeakReductionPct)}%. 합산 피크 차이는 ${fmt(r.load.combinedPeakDeltaKw)}kW이고, 평균 대기 차이는 ${fmt(r.wait-results[0].wait)}분입니다.</p>`).join('')}</div>
       <p class="sim-note">A의 피크가 줄어도 B 또는 합산 피크는 증가할 수 있습니다. 합산 피크는 같은 시각의 A+B 곡선에서 계산하며 A 피크+B 피크를 더하지 않습니다. SE는 반복 난수에 따른 표준오차이며 모델·행동 가정·미래 예측의 불확실성을 포함하지 않습니다.</p>
-      <p class="sim-load-legend"><span>━ 고정요금</span><span>━ 할인·할증</span><span>┄ 할인 전용</span></p>
       ${[0,1,2].map(i=>chart(result,i)).join('')}
       <p class="sim-note">곡선은 반복 평균입니다. 표는 반복별 최대값의 평균이므로 곡선의 최대값과 다를 수 있습니다. 모든 정책의 신규 충전 필요량과 초기 상태는 같습니다. 도착 종료 후에도 모든 차량이 완료될 때까지 계산하며, 부하율 차이는 동일한 도착 생성 기간에서 충전소별 처리 가능 대표 용량으로 나눈 평균 부하율의 절댓값 차이입니다. 이것만으로 변압기·배전선로 피크 저감을 입증하지 않습니다.</p>
       <details><summary>입력값과 근거</summary><div class="sim-table-wrap"><table class="sim-table sim-evidence-table"><thead><tr><th>항목</th><th>값</th><th>구분</th><th>근거와 한계</th></tr></thead><tbody>${evidence.map(r=>`<tr><th>${esc(r.item)}</th><td>${esc(r.value)}</td><td>${esc(r.kind)}</td><td>${esc(r.basis)}</td></tr>`).join('')}</tbody></table></div></details>`;
   }
   const styles = `body{font:15px/1.7 system-ui,sans-serif;color:#213b31;max-width:1100px;padding:28px;margin:auto}h1{font-size:25px}h3{font-size:20px}p{overflow-wrap:anywhere}.sim-table-wrap{overflow-x:auto}.sim-table{border-collapse:collapse;width:100%;font-size:13px;white-space:nowrap}.sim-table th,.sim-table td{padding:10px;border:1px solid #d7e2db;text-align:right}.sim-table th:first-child{text-align:left}.sim-table caption{text-align:left;padding:12px 0}.sim-table thead{background:#eef5ef}.sim-evidence-table{white-space:normal}.sim-evidence-table td{text-align:left}.sim-note{font-size:12px;color:#53695d}.sim-status{padding:12px;background:#fff0e9}.sim-load-chart{margin:22px 0}.sim-load-chart svg{display:block;width:100%;max-height:300px}.sim-load-legend{display:flex;gap:20px;flex-wrap:wrap}.sim-load-legend span:nth-child(1){color:#536474}.sim-load-legend span:nth-child(2){color:#245d4b}.sim-load-legend span:nth-child(3){color:#a66a17}@media print{body{padding:0;font-size:11px}.sim-load-chart, tr{break-inside:avoid}details{display:block}details>div{display:block!important}.sim-table{font-size:9px;white-space:normal}}`;
+  const legendStyles = '.sim-load-legend{margin:10px 0;font-size:12px}.sim-load-legend span{display:inline-flex;align-items:center;gap:6px}.sim-load-key{display:inline-block;flex:0 0 22px;width:22px;border-top:3px solid currentColor}.sim-load-chart figcaption{font-weight:600}';
   function html(result) {
-    return `<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ESSential 충전 부하 분석 리포트</title><style>${styles}</style></head><body><h1>ESSential 요금 정책 분석</h1>${render(result)}</body></html>`;
+    return `<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ESSential 충전 부하 분석 리포트</title><style>${styles}${legendStyles}</style></head><body><h1>ESSential 요금 정책 분석</h1>${render(result)}</body></html>`;
   }
   function rows(result) {
     if (!valid(result)) return [];
@@ -2094,7 +2103,7 @@ window.ESSMonitor.ready = detectServer();
         <label class="sim-wide">충전소 B<select id="sim-b" required></select></label>
         ${fields.map(([id, label, value, min, max, step]) => `<label>${label}<span id="sim-kind-${id}">${badge(id === 'distance' ? '추정값' : fieldKind(id))}</span><input id="sim-${id}" type="number" value="${value}" min="${min}" max="${max}" step="${step}" required></label>`).join('')}
         <label class="sim-wide">추가 거리 산정<select id="sim-distanceMode"><option value="coords">A↔B 좌표 직선거리 (A: 0km)</option><option value="manual">사용자 가정값 (A: 0km, B: 입력값)</option></select></label>
-        <label class="sim-wide">신규 차량 충전시간 ${badge('가정값')}<select id="sim-durationMode"><option value="assumed">20~40분 균등분포 (간소화 가정)</option><option value="power">충전량 ÷ 대표 출력 × 60분</option></select></label>
+        <label class="sim-wide">신규 차량 충전시간 ${badge('가정값')}<select id="sim-durationMode"><option value="power"${sim.defaults.durationMode === 'power' ? ' selected' : ''}>충전량 ÷ 대표 출력 × 60분 (기본)</option><option value="assumed"${sim.defaults.durationMode === 'assumed' ? ' selected' : ''}>20~40분 균등분포 (간소화 가정)</option></select></label>
         <label class="sim-wide">요금 판정 기준<select id="sim-pricingBasis"><option value="observed">현재 수집 상태</option><option value="forecast">외부 AI 모델 예측 이용률</option></select></label>
       </div>
       <div id="sim-forecast-panel" hidden>
@@ -2139,7 +2148,7 @@ window.ESSMonitor.ready = detectServer();
       </section>
       <details class="sim-card"><summary>모델 가정과 결과 읽는 방법</summary>
         <p>운전자의 도착 시각은 입력한 기간 내 균등분포로 생성합니다. A를 원래 목적지로 가정해 추가 거리 0km, B는 입력값 또는 충전소 간 직선거리를 사용합니다. 이동 소요시간은 따로 더하지 않으며 선택과 충전소 도착은 같은 시각에 처리합니다.</p>
-        <p>초기 충전 차량의 잔여시간은 0~30분 균등분포입니다. 출력 모드에서는 0~(충전량÷대표 출력×60)분입니다. 신규 충전시간은 20~40분 가정 또는 출력 계산을 사용합니다. 충전효율·배터리 충전곡선·출력 공유는 반영하지 않습니다. 혼합 출력 충전소는 기존 관제의 대표 출력·단가를 동일하게 적용합니다.</p>
+        <p>기본 충전시간은 충전량÷대표 출력×60분이며 초기 차량 잔여시간은 0~해당 시간의 균등분포입니다. 선택 가능한 20~40분 가정 모드에서는 초기 잔여시간을 0~30분으로 둡니다. 충전효율·배터리 충전곡선·출력 공유는 반영하지 않습니다. 혼합 출력 충전소는 기존 관제의 대표 출력·단가를 동일하게 적용합니다.</p>
         <p>판정 분모는 빈 충전기+충전 중이며 고장·미확인 충전기는 처리 능력에서 제외합니다. 요금 기준은 현재 상태 또는 외부 예측 이용률로 선택합니다. 예측 모드에서도 초기 점유는 실제 수집 상태이며 요금만 예측값으로 고정합니다. 예측 대상 미래 시점의 대기열을 복원하는 기능은 없습니다. AI 예측값을 임의 생성하지 않습니다.</p>
         <p>선택 당시 예상 대기는 이미 도착한 차량을 포함한 가장 빠른 충전기 사용 가능 시각으로 계산합니다. 실제 대기는 도착순 FIFO 예약 후 계산합니다. 같은 정보와 변경 없는 대기열을 사용하는 이 모델에서는 두 값이 일치합니다. 기간 내 도착한 모든 신규 차량을 충전 완료까지 집계하며 초기 차량의 요금은 제외합니다.</p>
         <p>결과는 반복 1회당 평균입니다. 평균 대기의 표준오차(SE)는 반복 실험 간 변동이며 실세계 예측 오차가 아닙니다. 총 할인 혜택은 기본 단가 대비 할인액의 합으로 사업자 순손실과 다릅니다. 수입 차이는 정책별 선택 충전소와 단가로 계산한 단순 매출 차이이며 비용을 반영하지 않습니다.</p>

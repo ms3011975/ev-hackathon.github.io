@@ -7,7 +7,7 @@
   const policies = ['고정요금', '할인·할증', '할인 전용'];
   const defaults = { drivers: 24, minutes: 60, energy: 30, discount: .2, surcharge: .15,
     alpha: 600, beta: 300, tau: 2000, sensitivity: 1, repeats: 100, seed: 42,
-    distance: 2, threshold: .5, durationMode: 'assumed' };
+    distance: 2, threshold: .5, durationMode: 'power' };
   const demo = () => [
     { id: 'DEMO-A', name: '예시 A · 혼잡 거점', lat: 36.6424, lng: 127.489, avail: 0, charging: 4, fault: 0, base: 347.2, kw: 60, speed: 'fast', source: '예시 단가' },
     { id: 'DEMO-B', name: '예시 B · 여유 거점', lat: 36.6604, lng: 127.489, avail: 3, charging: 1, fault: 0, base: 347.2, kw: 60, speed: 'fast', source: '예시 단가' }

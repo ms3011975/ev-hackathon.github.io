@@ -30,7 +30,7 @@
         <label class="sim-wide">충전소 B<select id="sim-b" required></select></label>
         ${fields.map(([id, label, value, min, max, step]) => `<label>${label}<span id="sim-kind-${id}">${badge(id === 'distance' ? '추정값' : fieldKind(id))}</span><input id="sim-${id}" type="number" value="${value}" min="${min}" max="${max}" step="${step}" required></label>`).join('')}
         <label class="sim-wide">추가 거리 산정<select id="sim-distanceMode"><option value="coords">A↔B 좌표 직선거리 (A: 0km)</option><option value="manual">사용자 가정값 (A: 0km, B: 입력값)</option></select></label>
-        <label class="sim-wide">신규 차량 충전시간 ${badge('가정값')}<select id="sim-durationMode"><option value="assumed">20~40분 균등분포 (간소화 가정)</option><option value="power">충전량 ÷ 대표 출력 × 60분</option></select></label>
+        <label class="sim-wide">신규 차량 충전시간 ${badge('가정값')}<select id="sim-durationMode"><option value="power"${sim.defaults.durationMode === 'power' ? ' selected' : ''}>충전량 ÷ 대표 출력 × 60분 (기본)</option><option value="assumed"${sim.defaults.durationMode === 'assumed' ? ' selected' : ''}>20~40분 균등분포 (간소화 가정)</option></select></label>
         <label class="sim-wide">요금 판정 기준<select id="sim-pricingBasis"><option value="observed">현재 수집 상태</option><option value="forecast">외부 AI 모델 예측 이용률</option></select></label>
       </div>
       <div id="sim-forecast-panel" hidden>
@@ -75,7 +75,7 @@
       </section>
       <details class="sim-card"><summary>모델 가정과 결과 읽는 방법</summary>
         <p>운전자의 도착 시각은 입력한 기간 내 균등분포로 생성합니다. A를 원래 목적지로 가정해 추가 거리 0km, B는 입력값 또는 충전소 간 직선거리를 사용합니다. 이동 소요시간은 따로 더하지 않으며 선택과 충전소 도착은 같은 시각에 처리합니다.</p>
-        <p>초기 충전 차량의 잔여시간은 0~30분 균등분포입니다. 출력 모드에서는 0~(충전량÷대표 출력×60)분입니다. 신규 충전시간은 20~40분 가정 또는 출력 계산을 사용합니다. 충전효율·배터리 충전곡선·출력 공유는 반영하지 않습니다. 혼합 출력 충전소는 기존 관제의 대표 출력·단가를 동일하게 적용합니다.</p>
+        <p>기본 충전시간은 충전량÷대표 출력×60분이며 초기 차량 잔여시간은 0~해당 시간의 균등분포입니다. 선택 가능한 20~40분 가정 모드에서는 초기 잔여시간을 0~30분으로 둡니다. 충전효율·배터리 충전곡선·출력 공유는 반영하지 않습니다. 혼합 출력 충전소는 기존 관제의 대표 출력·단가를 동일하게 적용합니다.</p>
         <p>판정 분모는 빈 충전기+충전 중이며 고장·미확인 충전기는 처리 능력에서 제외합니다. 요금 기준은 현재 상태 또는 외부 예측 이용률로 선택합니다. 예측 모드에서도 초기 점유는 실제 수집 상태이며 요금만 예측값으로 고정합니다. 예측 대상 미래 시점의 대기열을 복원하는 기능은 없습니다. AI 예측값을 임의 생성하지 않습니다.</p>
         <p>선택 당시 예상 대기는 이미 도착한 차량을 포함한 가장 빠른 충전기 사용 가능 시각으로 계산합니다. 실제 대기는 도착순 FIFO 예약 후 계산합니다. 같은 정보와 변경 없는 대기열을 사용하는 이 모델에서는 두 값이 일치합니다. 기간 내 도착한 모든 신규 차량을 충전 완료까지 집계하며 초기 차량의 요금은 제외합니다.</p>
         <p>결과는 반복 1회당 평균입니다. 평균 대기의 표준오차(SE)는 반복 실험 간 변동이며 실세계 예측 오차가 아닙니다. 총 할인 혜택은 기본 단가 대비 할인액의 합으로 사업자 순손실과 다릅니다. 수입 차이는 정책별 선택 충전소와 단가로 계산한 단순 매출 차이이며 비용을 반영하지 않습니다.</p>

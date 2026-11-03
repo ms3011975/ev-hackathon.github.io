@@ -108,7 +108,7 @@ test('sensitivity reuses randomness, is reproducible and handles percentages, mo
   for (const s of a.scenarios) for (const r of s.results) assert.ok(Math.abs(r.waitDelta-(r.wait-a.scenarios.find(x=>x.value===a.baseline).results[r.policy].wait))<1e-9);
   const f = await sim.sweep(sim.demo(),options,'discount',[.3],()=>{}, {'DEMO-A':.2,'DEMO-B':1});
   assert.equal(f.scenarios.find(x=>x.value===.3).results[1].prices[0],243);
-  const modes = await sim.sweep(sim.demo(),options,'durationMode',['power']);
+  const modes = await sim.sweep(sim.demo(),options,'durationMode',['assumed','power']);
   assert.equal(modes.scenarios.length,2);
 });
 test('sensitivity rejects invalid input, excessive work and supports cancellation', async () => {
@@ -184,7 +184,7 @@ test('unusable chargers excluded, including zero waiting cost', async () => {
   await assert.rejects(sim.compare(stations), /처리 가능한/);
 });
 test('fully occupied initial station waits until initial release and includes completions after horizon', () => {
-  const stations = sim.demo(), o = { ...sim.defaults, drivers: 2, minutes: 1 };
+  const stations = sim.demo(), o = { ...sim.defaults, drivers: 2, minutes: 1, durationMode: 'assumed' };
   Object.assign(stations[1], { avail: 0, charging: 0, fault: 4 });
   const r = sim.runPolicy(stations, o, { initial: [[.5, .5, .5, .5], []], drivers: [
     { id: 0, arrival: 0, duration: 40, choice: .1 }, { id: 1, arrival: .5, duration: 40, choice: .2 }
@@ -221,11 +221,12 @@ test('validation rejects mixed speeds, identical stations, invalid counts and in
   const stations = sim.demo(); stations[1].speed = 'slow'; await assert.rejects(sim.compare(stations));
   await assert.rejects(sim.compare([stations[0], stations[0]]));
 });
-test('power duration uses per-station output and initial remaining time', () => {
-  const stations = sim.demo(), o = { ...sim.defaults, durationMode: 'power' };
+test('default duration uses per-station output and initial remaining time without exceeding rating', () => {
+  const stations = sim.demo(), o = { ...sim.defaults };
   stations[0].kw = 30; Object.assign(stations[1], { avail: 0, charging: 0 });
   const r = sim.runPolicy(stations, o, { initial: [[.5, .5, .5, .5], []], drivers: [{ id: 0, arrival: 0, duration: 20, choice: .1 }] }, 0);
   assert.equal(r.records[0].start, 30); assert.equal(r.records[0].end, 90);
+  assert.equal(r.load.overRatedSessions, 0);
 });
 test('discount benefit and revenue differences are accounting identities', async () => {
   const { results, stations, options: o } = await sim.compare(sim.demo(), { repeats: 7 });
