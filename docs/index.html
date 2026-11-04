@@ -1897,6 +1897,8 @@ window.ESSMonitor.ready = detectServer();
         throw new Error(`${key}: ${lo}~${hi}${integer ? ' 정수' : ''} 값을 입력하세요.`);
     }
     if (!['assumed', 'power'].includes(o.durationMode)) throw new Error('충전시간 계산 방식을 확인하세요.');
+    if (o.roadDistances !== undefined && (!Array.isArray(o.roadDistances) || o.roadDistances.length!==2 || o.roadDistances.some(v=>!Number.isFinite(v)||v<0||v>200)))
+      throw new Error('A→B / B→A 도로 거리를 확인하세요 (각 0~200km).');
     if (stations.length !== 2 || stations[0].id === stations[1].id || stations[0].speed !== stations[1].speed)
       throw new Error('서로 다른 같은 종류의 충전소 A/B를 선택하세요.');
     for (const s of stations) {
@@ -1924,6 +1926,7 @@ window.ESSMonitor.ready = detectServer();
     return { initial, drivers };
   }
   const duration = (s, o, assumed) => o.durationMode === 'power' ? o.energy / s.kw * 60 : assumed;
+  const diversionDistance = (origin, destination, o) => origin === destination ? 0 : o.roadDistances?.[origin] ?? o.distance;
   // Energy-conserving constant equivalent power, not measured grid demand.
   // Initial sessions use representative output because their remaining energy is unknown.
   function loadProfile(stations, o, initial, records) {
@@ -1998,16 +2001,16 @@ window.ESSMonitor.ready = detectServer();
       const origin = d.origin ?? 0;
       const next = queues.map(q => q.length ? Math.min(...q) : Infinity);
       const expected = next.map(t => Math.max(0, t - d.arrival));
-      const costs = stations.map((s, i) => o.sensitivity * o.energy * quote[i] + o.alpha * (i !== origin ? o.distance : 0) + o.beta * expected[i]);
+      const costs = stations.map((s, i) => o.sensitivity * o.energy * quote[i] + o.alpha * diversionDistance(origin,i,o) + o.beta * expected[i]);
       // An unusable station must stay excluded even if beta=0 (0 * Infinity = NaN).
       const probs = probability(costs.map((c, i) => queues[i].length ? c : Infinity), o.tau);
       const i = d.choice < probs[0] ? 0 : 1, q = queues[i], slot = q.indexOf(next[i]);
       const start = Math.max(d.arrival, next[i]), actual = start - d.arrival;
       const end = start + duration(stations[i], o, d.duration);
       q[slot] = end; count[i]++; wait += actual; estimated += expected[i];
-      charge += o.energy * quote[i]; distance += i !== origin ? o.distance : 0;
+      charge += o.energy * quote[i]; distance += diversionDistance(origin,i,o);
       discount += o.energy * Math.max(0, stations[i].base - quote[i]); completion = Math.max(completion, end);
-      records.push({ driver: d.id, origin, station: i, price:quote[i], arrival: d.arrival, expectedWait: expected[i], actualWait: actual, start, end });
+      records.push({ driver: d.id, origin, station: i, price:quote[i], extraDistance:diversionDistance(origin,i,o), arrival: d.arrival, expectedWait: expected[i], actualWait: actual, start, end });
     }
     const n = people.drivers.length, denominator = n || 1;
     return { policy, prices, priceSchedule, drivers:n, count, share: count.map(v => v / denominator), wait: wait / denominator,
@@ -2119,6 +2122,7 @@ window.ESSMonitor.ready = detectServer();
     for (let i = 0; i < levels.length; i++) {
       if (cancelled()) throw new Error('분석을 중단했습니다.');
       const value = levels[i], o = { ...base, [key]: value };
+      if (key === 'distance' && value !== base.distance) delete o.roadDistances;
       const populations = bank.map(p => ({ initial: p.initial, drivers: p.drivers.filter(d => base.forecastPlan || d.id < o.drivers)
         .map(d => ({ ...d, arrival: o.minutes === base.minutes ? d.arrival : d.arrival / base.minutes * o.minutes })).sort((a, b) => a.arrival - b.arrival || a.id - b.id) }));
       const output = await compare(stations, o, p => onProgress((i + p) / levels.length), utilizationById, { populations, cancelled });
@@ -2166,7 +2170,11 @@ window.ESSMonitor.ready = detectServer();
     }
     for (const [key, label] of [['discount','여유 할인율'],['surcharge','혼잡 할증율'],['threshold','여유 판정 대기율']])
       add(label, `${o[key] * 100}%`, '정책 설정', '기존 프로젝트 기본 정책에서 시작. 정책 효과를 검증한 최적값이 아님');
-    add(o.forecastPlan ? '대체 충전소 추가 거리' : 'B 추가 거리', `${o.distance}km`, context.distanceMode === 'coords' ? '추정값' : '가정값', (context.distanceMode === 'coords' ? 'A/B 좌표의 직선거리. 도로 거리·이동시간 아님' : '사용자 지정 추가 거리.') + (o.forecastPlan ? ' 원래 A/B 선택지에서는 0km, 다른 곳으로 바꾸면 추가 거리 적용' : ' A는 0km 가정'));
+    if (context.distanceMode === 'road' && o.roadDistances) {
+      add('대체 충전소 도로 거리', `A→B ${o.roadDistances[0]}km / B→A ${o.roadDistances[1]}km`, '추정값',
+        `${context.roadRoute?.provider || 'OSRM car'} · 조회 ${context.roadRoute?.fetchedAt || '기록 없음'} · ${context.roadRoute?.url || ''}. OSM 도로 연결점 기준 최단시간 경로 거리. 실시간 교통·GPS 실측 아님. 도로 연결 오차 ${JSON.stringify(context.roadRoute?.snapMeters || [])}m. 원래 선택지에서는 0km, 변경 방향에 맞는 거리를 적용. 이동시간은 도착 시각에 더하지 않음. 차량 출발지·최종 목적지가 없어 실제 우회거리로 대체하는 가정이 남음.`);
+    } else if (context.distanceMode === 'road') add('대체 충전소 도로 거리','조회 필요','미입력','도로 거리 조회가 완료되어야 실행할 수 있음. 직선거리로 자동 대체하지 않음');
+    else add(o.forecastPlan ? '대체 충전소 추가 거리' : 'B 추가 거리', `${o.distance}km`, context.distanceMode === 'coords' ? '추정값' : '가정값', (context.distanceMode === 'coords' ? 'A/B 좌표의 직선거리. 도로 거리·이동시간 아님' : '사용자 지정 추가 거리. 양방향 동일 가정.') + (o.forecastPlan ? ' 원래 A/B 선택지에서는 0km, 다른 곳으로 바꾸면 추가 거리 적용' : ' A는 0km 가정'));
     add('신규 충전시간', o.durationMode === 'power' ? '충전량 ÷ 대표 출력 × 60분' : '20~40분 균등분포', '가정값', '간소화 모델. 충전효율·충전곡선·출력 공유 제외');
     add('초기 잔여 충전시간', o.durationMode === 'power' ? '0~(충전량 ÷ 대표 출력 × 60)분 균등분포' : '0~30분 균등분포', '가정값', '초기 차량의 실제 잔여시간은 관측하지 않음');
     add('도착·선택 모형', o.forecastPlan ? '구간·원래 선택지별 포아송 건수 + 구간 내 균등 도착 · 로짓 재선택' : '기간 내 균등 도착 · 로짓 선택', '가정값', '취소·포기·추가 이동시간 제외. 행동모델 실측 보정 전');
@@ -2184,7 +2192,7 @@ window.ESSMonitor.ready = detectServer();
     }
     return rows;
   }
-  return { defaults, energyProfile, energyDefault, behaviorProfiles, behaviorReference, behaviorKeys, behaviorConversion, behaviorMatch, compareBehavior, policies, demo, rng, status, price, probability, validate, population, runPolicy, loadProfile, compare, forecast, forecastV2, poisson, sweep, sweepKeys, evidence };
+  return { defaults, energyProfile, energyDefault, behaviorProfiles, behaviorReference, behaviorKeys, behaviorConversion, behaviorMatch, compareBehavior, policies, demo, rng, status, price, probability, validate, population, runPolicy, diversionDistance, loadProfile, compare, forecast, forecastV2, poisson, sweep, sweepKeys, evidence };
 });
 </script>
 <script>/* Shared browser/Node report rendering. All external labels are escaped. */
@@ -2269,7 +2277,7 @@ window.ESSMonitor.ready = detectServer();
       <p class="sim-note">가정 기반 시뮬레이션 · 15분 평균 등가 충전 부하 · 실제 배전망 측정 결과 아님</p>
       <p>${esc(c.source)} · ${esc(c.region)}<br>실행 시각: ${esc(kst(c.executedAt || '기록 없음'))}<br>요금 근거: ${esc(c.pricingBasis)} ${esc(c.forecastInfo)}<br>A: ${esc(result.stations[0].name)} (${esc(result.stations[0].id)}) / B: ${esc(result.stations[1].name)} (${esc(result.stations[1].id)})<br>신규 ${fmt(o.drivers,3)}명${o.forecastPlan?' (기대값)':''} · 도착 ${fmt(o.minutes)}분 · 차량당 ${o.energy}kWh · ${o.repeats}회 · 시드 ${o.seed}</p>
       ${o.forecastPlan ? `<p class="sim-status">생성 평균 ${fmt(result.population.mean,3)}명 · 범위 ${result.population.min}~${result.population.max}명 · 신규 0명 반복 ${result.population.emptyRuns}/${o.repeats}회. 대기시간·비용·거리는 전체 생성 차량을 기준으로 집계합니다. 모든 반복이 0명이라면 선택·대기·비용의 0은 효과 측정값을 의미하지 않습니다.</p>` : ''}
-      ${forecastTable(result)}
+      ${roadNotice(o,c)}${forecastTable(result)}
       ${overRated ? '<p class="sim-status" data-error="true">충전량과 가정 충전시간으로 계산한 등가 전력이 대표 출력을 넘는 차량이 있습니다. 현재 결과는 에너지 보존 시나리오이며 물리적으로 가능한 부하로 해석할 수 없습니다. 신규 차량 충전시간을 ‘충전량 ÷ 대표 출력’으로 바꾸어 다시 실행하세요.</p>' : '<p class="sim-note">신규 차량은 충전량÷소요시간의 일정 전력, 초기 차량은 대표 출력×가정 잔여시간으로 계산합니다. 실제 충전곡선·효율·출력 공유·비충전 부하는 제외합니다.</p>'}
       <div class="sim-table-wrap"><table class="sim-table"><caption>각 반복에서 지표를 계산한 뒤 평균 · 피크 저감률은 양수=감소, 음수=증가</caption><thead><tr><th>지표</th>${results.map(r=>`<th>${esc(r.label)}</th>`).join('')}</tr></thead><tbody>${metrics.map(([label,get])=>`<tr><th scope="row">${label}</th>${results.map(r=>`<td>${fmt(get(r))}</td>`).join('')}</tr>`).join('')}</tbody></table></div>
       <div class="sim-report-findings">${results.slice(1).map(r=>`<p><strong>${esc(r.label)}</strong>: 고정요금 대비 A 피크 저감률 ${pct(r.load.stationPeakReductionPct[0])}, B ${pct(r.load.stationPeakReductionPct[1])}, 합산 ${pct(r.load.combinedPeakReductionPct)}. 합산 피크 차이는 ${fmt(r.load.combinedPeakDeltaKw)}kW이고, 평균 대기 차이는 ${fmt(r.wait-results[0].wait)}분입니다.</p>`).join('')}</div>
@@ -2280,6 +2288,10 @@ window.ESSMonitor.ready = detectServer();
   }
   const styles = `body{font:15px/1.7 system-ui,sans-serif;color:#213b31;max-width:1100px;padding:28px;margin:auto}h1{font-size:25px}h3{font-size:20px}p{overflow-wrap:anywhere}.sim-table-wrap{overflow-x:auto}.sim-table{border-collapse:collapse;width:100%;font-size:13px;white-space:nowrap}.sim-table th,.sim-table td{padding:10px;border:1px solid #d7e2db;text-align:right}.sim-table th:first-child{text-align:left}.sim-table caption{text-align:left;padding:12px 0}.sim-table thead{background:#eef5ef}.sim-evidence-table{white-space:normal}.sim-evidence-table td{text-align:left}.sim-note{font-size:12px;color:#53695d}.sim-status{padding:12px;background:#fff0e9}.sim-load-chart{margin:22px 0}.sim-load-chart svg{display:block;width:100%;max-height:300px}.sim-load-legend{display:flex;gap:20px;flex-wrap:wrap}.sim-load-legend span:nth-child(1){color:#536474}.sim-load-legend span:nth-child(2){color:#245d4b}.sim-load-legend span:nth-child(3){color:#a66a17}@media print{body{padding:0;font-size:11px}.sim-load-chart, tr{break-inside:avoid}details{display:block}details>div{display:block!important}.sim-table{font-size:9px;white-space:normal}}`;
   const legendStyles = '.sim-load-legend{margin:10px 0;font-size:12px}.sim-load-legend span{display:inline-flex;align-items:center;gap:6px}.sim-load-key{display:inline-block;flex:0 0 22px;width:22px;border-top:3px solid currentColor}.sim-load-chart figcaption{font-weight:600}';
+  function roadNotice(o,c) {
+    if (c.distanceMode!=='road' || !o.roadDistances) return '';
+    return `<p class="sim-note">자동차 도로 거리 A→B ${fmt(o.roadDistances[0],3)}km / B→A ${fmt(o.roadDistances[1],3)}km · 조회 ${esc(kst(c.roadRoute?.fetchedAt || '기록 없음'))}. © <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a> · <a href="https://routing.openstreetmap.de/about.html">FOSSGIS OSRM car</a> · <a href="https://www.openstreetmap.org/">지도 오류 수정</a>. 도로 연결점 기준 경로 추정이며 실제 출입구·교통·전체 우회거리와 다를 수 있습니다. 이동시간은 도착 시각에 더하지 않습니다.</p>`;
+  }
   function behaviorRows(output) {
     const reference = output.profiles[0];
     return output.profiles.flatMap(profile => profile.results.map((r, i) => [
@@ -2295,7 +2307,7 @@ window.ESSMonitor.ready = detectServer();
     const c = output.context || {}, p = output.profiles[0].population;
     return `<p class="sim-note">${esc(c.source || '')} · ${esc(c.region || '')} · 실행 ${esc(kst(c.executedAt || '기록 없음'))}<br>${esc(c.pricingBasis || '')} · ${esc(c.forecastInfo || '')}</p>
       <p>기존 예시값(s=1, α=600, β=300, τ=2000)과 문헌 환산 후보(s=1, α=950, β=360, τ=7200)를 함께 바꿔 비교했습니다. A/B·예측 구간·차량·도착 시각·초기 잔여시간·선택 난수·요금 정책은 공유합니다. 현재 입력한 사용자 행동계수와의 비교는 아닙니다.</p>
-      <p class="sim-note">반복 ${output.base.repeats}회 · 기대 신규 ${fmt(p.expected,3)}명 · 생성 평균 ${fmt(p.mean,3)}명 (${p.min}~${p.max}) · 0명 반복 ${p.emptyRuns}회. 신규 차량이 적으면 선택 비율과 정책 효과 해석에 주의하세요.</p>
+      <p class="sim-note">반복 ${output.base.repeats}회 · 기대 신규 ${fmt(p.expected,3)}명 · 생성 평균 ${fmt(p.mean,3)}명 (${p.min}~${p.max}) · 0명 반복 ${p.emptyRuns}회. 신규 차량이 적으면 선택 비율과 정책 효과 해석에 주의하세요.</p>${roadNotice(output.base,c)}
       <div class="sim-table-wrap"><table class="sim-table"><caption>2개 행동계수 설정 × 3개 요금 정책 · 피크는 15분 평균 부하의 반복별 최대값 평균</caption><thead><tr>${behaviorHeaders.map(h=>`<th scope="col">${esc(h)}</th>`).join('')}</tr></thead><tbody>${behaviorRows(output).map(row=>`<tr>${row.map((v,i)=>i<2?`<th scope="row">${esc(v)}</th>`:`<td>${fmt(v)}</td>`).join('')}</tr>`).join('')}</tbody></table></div>
       <p class="sim-note">피크 저감률은 각 행동계수 설정 안에서 고정요금과 비교합니다. 오른쪽 두 변화 열은 같은 요금 정책에서 행동계수만 바꾼 차이입니다. 피크 차이가 음수이면 문헌 후보에서 더 낮습니다. 가정 민감도 비교이며 문헌 후보의 정확도나 최적 정책을 입증하지 않습니다.</p>`;
   }
@@ -2333,9 +2345,66 @@ window.ESSMonitor.ready = detectServer();
   return { render, html, rows, behaviorRender, behaviorHtml, behaviorCSV };
 });
 </script>
-<script>(function () {
+<script>/* Public-station road routing; shared by browser and Node verification. */
+(function (root, factory) {
+  if (typeof module === 'object' && module.exports) module.exports = factory();
+  else root.ESSRouting = factory();
+})(typeof globalThis !== 'undefined' ? globalThis : this, function () {
+  'use strict';
+  const endpoint = 'https://routing.openstreetmap.de/routed-car/table/v1/driving/';
+  const provider = 'FOSSGIS OSRM car · OpenStreetMap';
+  function key(stations) {
+    if (stations.length !== 2 || stations.some(s => !s || !Number.isFinite(s.lat) || !Number.isFinite(s.lng) || Math.abs(s.lat)>90 || Math.abs(s.lng)>180) || stations[0].id===stations[1].id)
+      throw new Error('좌표가 있는 서로 다른 충전소 A/B를 선택하세요.');
+    return stations.map(s=>`${s.id}:${s.lng.toFixed(6)},${s.lat.toFixed(6)}`).join('|');
+  }
+  function url(stations) {
+    key(stations);
+    return endpoint + stations.map(s=>`${s.lng.toFixed(6)},${s.lat.toFixed(6)}`).join(';') + '?annotations=distance,duration&radiuses=200;200';
+  }
+  function decode(data, stations, fetchedAt = new Date().toISOString()) {
+    const pairKey = key(stations);
+    if (data?.code !== 'Ok') throw new Error('자동차 도로 경로를 찾지 못했습니다. 다른 충전소 또는 수동 거리를 사용하세요.');
+    const positions = [[0,1],[1,0]];
+    const meters = positions.map(([i,j])=>data.distances?.[i]?.[j]);
+    const seconds = positions.map(([i,j])=>data.durations?.[i]?.[j]);
+    if (meters.some(v=>!Number.isFinite(v)||v<0||v>200000) || seconds.some(v=>!Number.isFinite(v)||v<0))
+      throw new Error('양방향 경로가 없거나 지원 거리(각 200km)를 벗어났습니다. 다른 충전소 또는 수동 거리를 사용하세요.');
+    const snaps = data.sources?.map(s=>s.distance);
+    if (!snaps || snaps.length!==2 || snaps.some(v=>!Number.isFinite(v)||v<0||v>200))
+      throw new Error('충전소 200m 이내 도로 연결점을 확인하지 못했습니다. 지도에서 진입로를 확인하고 수동 거리를 입력하세요.');
+    return { key: pairKey, stationIds: stations.map(s=>s.id), provider, url:url(stations), fetchedAt,
+      roadDistances: meters.map(v=>Math.round(v)/1000), meters, seconds, snapMeters:snaps,
+      dataVersion: data.data_version || '서비스 미제공', method:'OSRM car 최단시간 도로 경로의 거리. 양방향 개별 계산. 실시간 교통·GPS 실측·실제 출입구 경로 아님' };
+  }
+  function createClient(fetcher, { now = Date.now, sleep = ms=>new Promise(resolve=>setTimeout(resolve,ms)), timeoutMs=15000 } = {}) {
+    const cache = new Map(), pending = new Map();
+    let chain = Promise.resolve(), lastRequest = -Infinity;
+    function get(stations, force = false) {
+      const snapshot = stations.map(s=>s && ({id:s.id,lat:s.lat,lng:s.lng})), k=key(snapshot), stored=cache.get(k);
+      if (!force && stored && now()-stored.at<1800000) return Promise.resolve(stored.result);
+      if (pending.has(k)) return pending.get(k);
+      const work = chain.catch(()=>{}).then(async()=>{
+        const delay=Math.max(0,1000-(now()-lastRequest)); if(delay) await sleep(delay);
+        lastRequest=now();
+        const response=await fetcher(url(snapshot),{credentials:'omit',signal:AbortSignal.timeout(timeoutMs)});
+        if (!response.ok) throw new Error(`도로 경로 서비스 응답 ${response.status}. 다시 조회하거나 수동 거리를 사용하세요.`);
+        const result=decode(await response.json(),snapshot,new Date(now()).toISOString());
+        cache.set(k,{at:now(),result}); return result;
+      });
+      const tracked=work.finally(()=>pending.delete(k));
+      pending.set(k,tracked); chain=tracked.catch(()=>{}); return tracked;
+    }
+    return {get};
+  }
+  return {key,url,decode,createClient,provider};
+});
+
+(function () {
   'use strict';
   const sim = window.ESSimulation, config = JSON.parse(document.getElementById('sim-config').textContent);
+  const routing = window.ESSRouting, roadClient = routing.createClient((url, opts)=>fetch(url, opts));
+  let roadState = null, roadTimer;
   const $ = id => document.getElementById(id), escape = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
   const fmt = (n, d = 1) => Number.isFinite(n) ? n.toLocaleString('ko-KR', { minimumFractionDigits: d, maximumFractionDigits: d }) : '—';
   const kst = value => Number.isFinite(Date.parse(value)) ? new Date(value).toLocaleString('ko-KR',{timeZone:'Asia/Seoul',hourCycle:'h23'})+' (한국 시각)' : String(value ?? '');
@@ -2345,7 +2414,7 @@ window.ESSMonitor.ready = detectServer();
     ['energy', '차량당 충전량 (kWh)', sim.energyDefault('fast'), .1, 200, .01], ['sensitivity', '가격 민감도 (배)', 1, 0, 10, .1],
     ['alpha', '이동 비용 α (원/km)', 600, 0, 100000, 10], ['beta', '대기 비용 β (원/분)', 300, 0, 100000, 10],
     ['tau', '선택 다양성 τ (원)', 2000, 1, 100000, 1], ['threshold', '여유 판정 대기율 (%)', config.threshold * 100, 10, 90, 1],
-    ['distance', 'B 추가 거리 (km)', 2, 0, 200, .001], ['repeats', '반복 실험 (회)', 100, 1, 500, 1], ['seed', '난수 시드', 42, 0, 4294967295, 1]
+    ['distance', 'A→B 차량 이동거리 (km)', 2, 0, 200, .001], ['repeats', '반복 실험 (회)', 100, 1, 500, 1], ['seed', '난수 시드', 42, 0, 4294967295, 1]
   ];
   const policiesFields = new Set(['discount', 'surcharge', 'threshold']);
   const experimentFields = new Set(['repeats', 'seed']);
@@ -2370,7 +2439,9 @@ window.ESSMonitor.ready = detectServer();
         <label class="sim-wide">운전자 행동계수 설정<select id="sim-behaviorPreset"><option value="legacy">기존 예시값 · 1 / 600 / 300 / 2000</option><option value="literature">문헌 환산 후보 · 1 / 950 / 360 / 7200 (급속)</option><option value="custom">사용자 가정값 · 직접 입력</option></select></label>
         <p class="sim-wide sim-note" id="sim-behavior-note"></p>
         ${fields.map(([id, label, value, min, max, step]) => `<label>${label}<span id="sim-kind-${id}">${badge(id === 'distance' ? '추정값' : fieldKind(id))}</span><input id="sim-${id}" type="number" value="${value}" min="${min}" max="${max}" step="${step}" required></label>`).join('')}
-        <label class="sim-wide">추가 거리 산정<select id="sim-distanceMode"><option value="coords">A↔B 좌표 직선거리 (A: 0km)</option><option value="manual">사용자 가정값 (A: 0km, B: 입력값)</option></select></label>
+        <label class="sim-wide">추가 거리 산정<select id="sim-distanceMode"><option value="road">자동차 도로 이동거리 · 방향별 자동 조회</option><option value="manual">사용자 입력 거리 · 양방향 동일 가정</option></select></label>
+        <p id="sim-road-status" class="sim-note sim-wide" role="status"></p>
+        <button type="button" class="sim-wide" id="sim-road-reload">도로 거리 다시 조회</button>
         <label class="sim-wide">신규 차량 충전시간 ${badge('가정값')}<select id="sim-durationMode"><option value="power"${sim.defaults.durationMode === 'power' ? ' selected' : ''}>충전량 ÷ 대표 출력 × 60분 (기본)</option><option value="assumed"${sim.defaults.durationMode === 'assumed' ? ' selected' : ''}>20~40분 균등분포 (간소화 가정)</option></select></label>
         <label class="sim-wide">요금·수요 기준<select id="sim-pricingBasis"><option value="observed">현재 수집 상태 + 수동 수요</option><option value="forecast">AI 1시간 후 이용률 + 수동 수요 (v1)</option><option value="forecast-v2">AI 15분 구간 이용률·신규 건수 (v2)</option></select></label>
       </div>
@@ -2461,7 +2532,7 @@ window.ESSMonitor.ready = detectServer();
       <p>원문 계수: 비용 −0.132 (USD/100마일 충전분), 우회시간 −0.066/분, 대기시간 −0.050/분, 충전거리 탄력성 0.35168.</p>
       <p>환산 가정: 참조 충전량 14.82kWh, 전비 6km/kWh, 1USD=1,400원, 우회속도 30km/h. ${escape(b.income)}. 가격 민감도 1은 원화 비용을 기준으로 한 정규화입니다.</p>
       <p>r=14.82×6÷160.9344=${fmt(x.r,6)}<br>τ=1400×r^(1−0.35168)÷0.132=${fmt(x.tau,2)}원<br>α=0.066×τ×60÷30=${fmt(x.alpha,2)}원/km<br>β=0.050×τ=${fmt(x.beta,2)}원/분</p>
-      <p>적용값은 s=1, α=950, β=360, τ=7200으로 반올림했습니다. 참조 환산을 고정하며 화면 충전량·직선거리에서 재환산하지 않습니다. ${escape(b.limitation)}</p>
+      <p>적용값은 s=1, α=950, β=360, τ=7200으로 반올림했습니다. 참조 환산을 고정하며 화면 충전량·도로 거리에서 재환산하지 않습니다. ${escape(b.limitation)}</p>
       <p><a href="https://github.com/ms3011975/ev-hackathon.github.io/blob/main/docs/behavior-presets.md" target="_blank" rel="noopener">팀 공유용 비교 방법과 근거</a></p>`;
   }
   $('sim-behavior-reference-content').innerHTML = behaviorReferenceHTML();
@@ -2480,13 +2551,57 @@ window.ESSMonitor.ready = detectServer();
     renderEvidence();
   }
   function distance() {
-    const [a, b] = selected();
-    const coords = $('sim-distanceMode').value === 'coords'; $('sim-distance').readOnly = coords;
-    $('sim-kind-distance').innerHTML = badge(coords ? '추정값' : '가정값');
-    if (coords && a && b) {
-      const rad = Math.PI / 180, h = Math.sin((b.lat - a.lat) * rad / 2) ** 2 + Math.cos(a.lat * rad) * Math.cos(b.lat * rad) * Math.sin((b.lng - a.lng) * rad / 2) ** 2;
-      $('sim-distance').value = (6371 * 2 * Math.asin(Math.sqrt(Math.min(1, h)))).toFixed(3);
+    const auto = $('sim-distanceMode').value === 'road'; $('sim-distance').readOnly = auto;
+    $('sim-road-reload').disabled = !auto || busy;
+    clearTimeout(roadTimer);
+    if (!auto) {
+      $('sim-kind-distance').innerHTML = badge('가정값');
+      $('sim-road-status').textContent = '입력한 거리를 양방향에 동일하게 적용합니다. 지도에서 확인한 도로 거리를 직접 입력할 수 있습니다. 이동시간은 도착 시각에 더하지 않습니다.';
+      return;
     }
+    let k; try { k=routing.key(selected()); } catch {
+      $('sim-distance').value=''; $('sim-kind-distance').innerHTML=badge('미입력');
+      $('sim-road-status').textContent='좌표가 있는 서로 다른 충전소 A/B를 선택하면 도로 거리를 조회합니다.'; return;
+    }
+    if (roadState?.key===k && roadState.status==='ready') return showRoad(roadState.result);
+    $('sim-distance').value=''; $('sim-kind-distance').innerHTML=badge('미입력');
+    if (roadState?.key===k && roadState.status==='error') { $('sim-road-status').textContent=roadState.error; return; }
+    roadState={key:k,status:'pending'};
+    $('sim-road-status').textContent='A→B / B→A 자동차 도로 거리를 조회하는 중입니다…';
+    roadTimer=setTimeout(()=>lookupRoad().catch(()=>{}),300);
+  }
+  function showRoad(result) {
+    $('sim-distance').value=result.roadDistances[0].toFixed(3);
+    $('sim-kind-distance').innerHTML=badge('추정값');
+    $('sim-road-status').innerHTML=`도로 거리 A→B <strong>${fmt(result.roadDistances[0],3)}km</strong> / B→A <strong>${fmt(result.roadDistances[1],3)}km</strong>. 경로 이동시간 참고 ${fmt(result.seconds[0]/60,1)} / ${fmt(result.seconds[1]/60,1)}분. 조회 ${escape(kst(result.fetchedAt))}.<br>© <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap contributors</a> · <a href="https://routing.openstreetmap.de/about.html" target="_blank" rel="noopener">FOSSGIS OSRM car</a> · <a href="https://www.openstreetmap.org/" target="_blank" rel="noopener">지도 오류 수정</a>.<br>충전소 인근 도로 연결점 기준의 최단시간 경로 거리이며 실시간 교통·GPS 실측값이 아닙니다. 연결점 오차 A ${fmt(result.snapMeters[0])}m / B ${fmt(result.snapMeters[1])}m. 출발지·최종 목적지가 없어 실제 우회거리는 별도 가정이며, 이동시간은 도착 시각에 더하지 않습니다.`;
+  }
+  async function lookupRoad(force=false) {
+    clearTimeout(roadTimer);
+    const stations=selected().map(s=>s && ({...s})), k=routing.key(stations);
+    const current=()=>{
+      try {return $('sim-distanceMode').value==='road' && routing.key(selected())===k;} catch {return false;}
+    };
+    roadState={key:k,status:'pending'};
+    $('sim-road-status').textContent='자동차 도로 경로 조회 중…';
+    try {
+      const result=await roadClient.get(stations,force);
+      if (!current()) throw new Error('거리 조회 중 충전소 선택이 변경됐습니다. 다시 실행하세요.');
+      roadState={key:k,status:'ready',result}; showRoad(result); invalidate(); return result;
+    } catch(error) {
+      if (current()) {
+        const msg=`도로 거리 조회 실패: ${error.message} 직선거리로 대체하지 않았습니다. ‘도로 거리 다시 조회’ 또는 ‘사용자 입력 거리’를 선택하세요.`;
+        roadState={key:k,status:'error',error:msg}; $('sim-distance').value='';
+        $('sim-kind-distance').innerHTML=badge('미입력'); $('sim-road-status').textContent=msg; invalidate();
+      }
+      throw error;
+    }
+  }
+  async function ensureRoad() {
+    if ($('sim-distanceMode').value!=='road') return;
+    const k=routing.key(selected());
+    if (roadState?.key===k && roadState.status==='ready') return;
+    if (roadState?.key===k && roadState.status==='error') throw new Error(roadState.error);
+    await lookupRoad();
   }
   function cards() {
     updateBehavior();
@@ -2534,7 +2649,7 @@ window.ESSMonitor.ready = detectServer();
         sourceWhen = data.when || '';
         const pair = choosePool(data.list.map(s => ({ id: s.id, name: s.name, lat: s.lat, lng: s.lng, speed,
           ...s[speed], unknown: s[speed].total - s[speed].avail - s[speed].charging - s[speed].fault, source: s[speed].src || '기존 운영사 요금표' })));
-        message(pool.length < 2 ? '동일 종류의 처리 가능한 충전소가 2곳 미만입니다. 예시 데이터 모드로 전환해 주세요.' : pair ? '같은 종류의 혼잡 A와 가장 가까운 여유 B를 선택했습니다. 다른 충전소도 직접 선택할 수 있습니다. 거리는 별도 설정을 확인하세요.' : '혼잡 A·여유 B 조건에 맞는 쌍이 없습니다. 비교 가능한 두 거점을 표시했습니다. 예시 데이터 모드도 사용할 수 있습니다.');
+        message(pool.length < 2 ? '동일 종류의 처리 가능한 충전소가 2곳 미만입니다. 예시 데이터 모드로 전환해 주세요.' : pair ? '같은 종류의 혼잡 A와 좌표상 가까운 여유 B를 선택했습니다. 다른 충전소도 직접 선택할 수 있습니다. 도로 경로 거리는 별도로 조회합니다.' : '혼잡 A·여유 B 조건에 맞는 쌍이 없습니다. 비교 가능한 두 거점을 표시했습니다. 예시 데이터 모드도 사용할 수 있습니다.');
       }
       if (preserveSelection) {
         for (const [i,id] of previous.entries()) if (pool.some(s=>s.id===id)) $('sim-'+(i?'b':'a')).value=id;
@@ -2548,12 +2663,16 @@ window.ESSMonitor.ready = detectServer();
     const o = Object.fromEntries(fields.map(([key]) => [key, +$('sim-' + key).value]));
     for (const k of ['discount', 'surcharge', 'threshold']) o[k] /= 100;
     o.durationMode = $('sim-durationMode').value;
+    if ($('sim-distanceMode').value==='road') {
+      try {if (roadState?.status==='ready' && roadState.key===routing.key(selected())) o.roadDistances=[...roadState.result.roadDistances];} catch { /* incomplete pair shown as missing */ }
+    }
     if (prediction?.plan) Object.assign(o,{drivers:prediction.plan.expectedDrivers,minutes:prediction.plan.minutes,forecastPlan:prediction.plan});
     return o;
   }
   function context(prediction) {
     return { source, executedAt: new Date().toISOString(), region: $('sim-mode').value === 'demo' ? '예시 · 지역 무관' : $('sim-region').selectedOptions[0].text,
       mode: $('sim-mode').value, speed: $('sim-speed').value, distanceMode: $('sim-distanceMode').value, energySource: $('sim-energySource').value, behaviorPreset: $('sim-behaviorPreset').value,
+      roadRoute: $('sim-distanceMode').value==='road' && roadState?.status==='ready' ? roadState.result : null,
       forecastRequested: $('sim-pricingBasis').value !== 'observed',
       pricingBasis: $('sim-pricingBasis').value === 'forecast-v2' ? 'v2 구간별 예측 요금·충전 시작 건수 기반 수요' : $('sim-pricingBasis').value === 'forecast' ? 'v1 1시간 후 이용률 (요금에만 적용)' : '현재 수집 상태',
       forecastInfo: prediction ? `${prediction.model} · 생성 ${kst(prediction.generatedAt)} · 대상 ${kst(prediction.targetTime)}` : '',
@@ -2573,6 +2692,7 @@ window.ESSMonitor.ready = detectServer();
     busy = active; $('sim-controls').disabled = active; $('sim-sweep-controls').disabled = active;
     $('sim-run').disabled = active || pool.length < 2; $('sim-reload').disabled = active;
     $('sim-connect').disabled = active;
+    $('sim-road-reload').disabled = active || $('sim-distanceMode').value!=='road';
     $('sim-behavior-run').disabled = active || $('sim-speed').value !== 'fast' || pool.length < 2;
     if (!active) $('sim-region').disabled = $('sim-mode').value === 'demo';
   }
@@ -2581,7 +2701,7 @@ window.ESSMonitor.ready = detectServer();
     const maxDiscount = Math.max(1, ...results.map(r => r.discount));
     const bar = (r, value, max, unit) => `<div class="sim-bar-row"><div class="sim-bar-label"><span>${r.label}</span><b>${fmt(value)}${unit}</b></div><div class="sim-track"><div class="sim-fill sim-wait" style="width:${value / max * 100}%"></div></div></div>`;
     $('sim-results').innerHTML = `<div class="sim-card"><h3>03 · 세 정책, 같은 운전자</h3>
-      <p class="sim-note" id="sim-result-state">${escape(result.context.source)} · ${escape(result.context.region)} · 가상 시뮬레이션 결과<br>요금 기준: ${escape(result.context.pricingBasis)}<br>행동계수: ${escape(sim.behaviorProfiles[sim.behaviorMatch(o,result.context)]?.label || "사용자 가정값")}<br>${escape(result.context.forecastInfo || '')}<br>반복 ${o.repeats}회 · 신규 ${o.forecastPlan ? `기대 ${fmt(o.drivers,3)}명 / 생성 평균 ${fmt(result.population.mean,3)}명 (${result.population.min}~${result.population.max})` : o.drivers+'명'} · 도착 ${fmt(o.minutes,2)}분 · ${o.energy}kWh · 시드 ${o.seed} · 대체 거리 ${fmt(o.distance, 3)}km</p>
+      <p class="sim-note" id="sim-result-state">${escape(result.context.source)} · ${escape(result.context.region)} · 가상 시뮬레이션 결과<br>요금 기준: ${escape(result.context.pricingBasis)}<br>행동계수: ${escape(sim.behaviorProfiles[sim.behaviorMatch(o,result.context)]?.label || "사용자 가정값")}<br>${escape(result.context.forecastInfo || '')}<br>반복 ${o.repeats}회 · 신규 ${o.forecastPlan ? `기대 ${fmt(o.drivers,3)}명 / 생성 평균 ${fmt(result.population.mean,3)}명 (${result.population.min}~${result.population.max})` : o.drivers+'명'} · 도착 ${fmt(o.minutes,2)}분 · ${o.energy}kWh · 시드 ${o.seed} · ${o.roadDistances ? `도로 A→B ${fmt(o.roadDistances[0],3)} / B→A ${fmt(o.roadDistances[1],3)}km` : `사용자 거리 ${fmt(o.distance,3)}km`}</p>
       ${o.forecastPlan ? `<p class="sim-note">신규 0명 반복 ${result.population.emptyRuns}/${o.repeats}회. 선택 비율·대기·요금·거리는 전체 생성 차량을 기준으로 집계합니다. 표의 단가는 시간가중 평균이며 각 차량은 도착 구간 단가를 적용합니다. 구간별 단가와 수요는 아래 분석 리포트에 기록합니다.</p>` : ''}
       <div class="sim-table-wrap"><table class="sim-table"><caption>정책별 비교 (반복 1회당 평균)</caption><thead><tr><th>지표</th>${results.map(r => `<th scope="col">${r.label}</th>`).join('')}</tr></thead><tbody>
       ${[
@@ -2691,7 +2811,7 @@ window.ESSMonitor.ready = detectServer();
       const key = $('sim-sweep-key').value, parts = $('sim-sweep-values').value.split(',').map(s=>s.trim());
       if (parts.some(s=>!s)) throw new Error('쉼표로 구분한 비교값을 입력하세요. 빈 값은 사용할 수 없습니다.');
       const values = key === 'durationMode' ? parts : parts.map(v => Number(v) / (policiesFields.has(key) ? 100 : 1));
-      const prediction = await preparePrediction();
+      const prediction = await preparePrediction(); await ensureRoad();
       const capturedContext = context(prediction), capturedOptions = options(prediction);
       const currentStations = selected().map(s=>({...s}));
       if (lastSweep) $('sim-sweep-export').disabled = true;
@@ -2710,7 +2830,7 @@ window.ESSMonitor.ready = detectServer();
     lock(true); $('sim-progress').hidden = false;
     message('세 정책에 동일한 운전자를 적용해 계산하고 있습니다…');
     try {
-      const prediction = await preparePrediction();
+      const prediction = await preparePrediction(); await ensureRoad();
       const result = await sim.compare(selected(), options(prediction), p => { $('sim-progress').value = p; }, prediction?.utilizationById);
       result.context = context(prediction);
       result.evidence = sim.evidence(result.stations, result.options, result.context);
@@ -2727,7 +2847,7 @@ window.ESSMonitor.ready = detectServer();
     $('sim-behavior-export').disabled = true; $('sim-behavior-html').disabled = true;
     try {
       $('sim-behavior-status').textContent = '예측과 충전소 상태를 한 번 읽어 두 설정에 공유합니다…';
-      const prediction = await preparePrediction(), capturedContext = context(prediction);
+      const prediction = await preparePrediction(); await ensureRoad(); const capturedContext = context(prediction);
       const output = await sim.compareBehavior(selected(), options(prediction), p => {$('sim-behavior-status').textContent=`행동계수 비교 중… ${Math.round(p*100)}%`;}, prediction?.utilizationById, ()=>cancelBehavior);
       output.context = {...capturedContext,behaviorPreset:'legacy vs literature'};
       for (const p of output.profiles) {
@@ -2768,9 +2888,9 @@ window.ESSMonitor.ready = detectServer();
       else if (!derived && manualDemand) input.value=manualDemand[key];
     }
     if (!derived) manualDemand=null;
-    $('sim-distance').parentElement.firstChild.textContent=derived?'대체 충전소 추가 거리 (km)':'B 추가 거리 (km)';
-    $('sim-distanceMode').options[0].textContent=derived?'A↔B 좌표 직선거리 (선택 변경 시)':'A↔B 좌표 직선거리 (A: 0km)';
-    $('sim-distanceMode').options[1].textContent=derived?'사용자 가정값 (선택 변경 시)':'사용자 가정값 (A: 0km, B: 입력값)';
+    $('sim-distance').parentElement.firstChild.textContent='A→B 차량 이동거리 (km)';
+    $('sim-distanceMode').options[0].textContent='자동차 도로 이동거리 · 방향별 자동 조회';
+    $('sim-distanceMode').options[1].textContent='사용자 입력 거리 · 양방향 동일 가정';
     for (const option of $('sim-sweep-key').options) if (['drivers','minutes'].includes(option.value)) option.disabled=derived;
     if (derived && ['drivers','minutes'].includes($('sim-sweep-key').value)) { $('sim-sweep-key').value='discount'; presetSweep(); }
   }
@@ -2857,6 +2977,7 @@ window.ESSMonitor.ready = detectServer();
   for (const id of ['mode', 'region', 'speed']) $('sim-' + id).addEventListener('change', ()=>{updateEnergy();load();});
   for (const id of ['a', 'b', 'distanceMode', 'threshold']) $('sim-' + id).addEventListener('change', ()=>{cards();if ($('sim-pricingBasis').value!=='observed') checkForecast();});
   $('sim-reload').addEventListener('click', load);
+  $('sim-road-reload').addEventListener('click', async()=>{if(busy) return; invalidate(); try {await lookupRoad(true);} catch { /* route status has the error */ }});
   for (const [id, active] of [['tab-monitor', false], ['tab-simulation', true]]) $(id).addEventListener('click', () => {
     $('monitor-view').hidden = active; $('simulation-view').hidden = !active;
     $('tab-monitor').setAttribute('aria-pressed', String(!active)); $('tab-simulation').setAttribute('aria-pressed', String(active));

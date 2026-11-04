@@ -172,6 +172,8 @@
         throw new Error(`${key}: ${lo}~${hi}${integer ? ' 정수' : ''} 값을 입력하세요.`);
     }
     if (!['assumed', 'power'].includes(o.durationMode)) throw new Error('충전시간 계산 방식을 확인하세요.');
+    if (o.roadDistances !== undefined && (!Array.isArray(o.roadDistances) || o.roadDistances.length!==2 || o.roadDistances.some(v=>!Number.isFinite(v)||v<0||v>200)))
+      throw new Error('A→B / B→A 도로 거리를 확인하세요 (각 0~200km).');
     if (stations.length !== 2 || stations[0].id === stations[1].id || stations[0].speed !== stations[1].speed)
       throw new Error('서로 다른 같은 종류의 충전소 A/B를 선택하세요.');
     for (const s of stations) {
@@ -199,6 +201,7 @@
     return { initial, drivers };
   }
   const duration = (s, o, assumed) => o.durationMode === 'power' ? o.energy / s.kw * 60 : assumed;
+  const diversionDistance = (origin, destination, o) => origin === destination ? 0 : o.roadDistances?.[origin] ?? o.distance;
   // Energy-conserving constant equivalent power, not measured grid demand.
   // Initial sessions use representative output because their remaining energy is unknown.
   function loadProfile(stations, o, initial, records) {
@@ -273,16 +276,16 @@
       const origin = d.origin ?? 0;
       const next = queues.map(q => q.length ? Math.min(...q) : Infinity);
       const expected = next.map(t => Math.max(0, t - d.arrival));
-      const costs = stations.map((s, i) => o.sensitivity * o.energy * quote[i] + o.alpha * (i !== origin ? o.distance : 0) + o.beta * expected[i]);
+      const costs = stations.map((s, i) => o.sensitivity * o.energy * quote[i] + o.alpha * diversionDistance(origin,i,o) + o.beta * expected[i]);
       // An unusable station must stay excluded even if beta=0 (0 * Infinity = NaN).
       const probs = probability(costs.map((c, i) => queues[i].length ? c : Infinity), o.tau);
       const i = d.choice < probs[0] ? 0 : 1, q = queues[i], slot = q.indexOf(next[i]);
       const start = Math.max(d.arrival, next[i]), actual = start - d.arrival;
       const end = start + duration(stations[i], o, d.duration);
       q[slot] = end; count[i]++; wait += actual; estimated += expected[i];
-      charge += o.energy * quote[i]; distance += i !== origin ? o.distance : 0;
+      charge += o.energy * quote[i]; distance += diversionDistance(origin,i,o);
       discount += o.energy * Math.max(0, stations[i].base - quote[i]); completion = Math.max(completion, end);
-      records.push({ driver: d.id, origin, station: i, price:quote[i], arrival: d.arrival, expectedWait: expected[i], actualWait: actual, start, end });
+      records.push({ driver: d.id, origin, station: i, price:quote[i], extraDistance:diversionDistance(origin,i,o), arrival: d.arrival, expectedWait: expected[i], actualWait: actual, start, end });
     }
     const n = people.drivers.length, denominator = n || 1;
     return { policy, prices, priceSchedule, drivers:n, count, share: count.map(v => v / denominator), wait: wait / denominator,
@@ -394,6 +397,7 @@
     for (let i = 0; i < levels.length; i++) {
       if (cancelled()) throw new Error('분석을 중단했습니다.');
       const value = levels[i], o = { ...base, [key]: value };
+      if (key === 'distance' && value !== base.distance) delete o.roadDistances;
       const populations = bank.map(p => ({ initial: p.initial, drivers: p.drivers.filter(d => base.forecastPlan || d.id < o.drivers)
         .map(d => ({ ...d, arrival: o.minutes === base.minutes ? d.arrival : d.arrival / base.minutes * o.minutes })).sort((a, b) => a.arrival - b.arrival || a.id - b.id) }));
       const output = await compare(stations, o, p => onProgress((i + p) / levels.length), utilizationById, { populations, cancelled });
@@ -441,7 +445,11 @@
     }
     for (const [key, label] of [['discount','여유 할인율'],['surcharge','혼잡 할증율'],['threshold','여유 판정 대기율']])
       add(label, `${o[key] * 100}%`, '정책 설정', '기존 프로젝트 기본 정책에서 시작. 정책 효과를 검증한 최적값이 아님');
-    add(o.forecastPlan ? '대체 충전소 추가 거리' : 'B 추가 거리', `${o.distance}km`, context.distanceMode === 'coords' ? '추정값' : '가정값', (context.distanceMode === 'coords' ? 'A/B 좌표의 직선거리. 도로 거리·이동시간 아님' : '사용자 지정 추가 거리.') + (o.forecastPlan ? ' 원래 A/B 선택지에서는 0km, 다른 곳으로 바꾸면 추가 거리 적용' : ' A는 0km 가정'));
+    if (context.distanceMode === 'road' && o.roadDistances) {
+      add('대체 충전소 도로 거리', `A→B ${o.roadDistances[0]}km / B→A ${o.roadDistances[1]}km`, '추정값',
+        `${context.roadRoute?.provider || 'OSRM car'} · 조회 ${context.roadRoute?.fetchedAt || '기록 없음'} · ${context.roadRoute?.url || ''}. OSM 도로 연결점 기준 최단시간 경로 거리. 실시간 교통·GPS 실측 아님. 도로 연결 오차 ${JSON.stringify(context.roadRoute?.snapMeters || [])}m. 원래 선택지에서는 0km, 변경 방향에 맞는 거리를 적용. 이동시간은 도착 시각에 더하지 않음. 차량 출발지·최종 목적지가 없어 실제 우회거리로 대체하는 가정이 남음.`);
+    } else if (context.distanceMode === 'road') add('대체 충전소 도로 거리','조회 필요','미입력','도로 거리 조회가 완료되어야 실행할 수 있음. 직선거리로 자동 대체하지 않음');
+    else add(o.forecastPlan ? '대체 충전소 추가 거리' : 'B 추가 거리', `${o.distance}km`, context.distanceMode === 'coords' ? '추정값' : '가정값', (context.distanceMode === 'coords' ? 'A/B 좌표의 직선거리. 도로 거리·이동시간 아님' : '사용자 지정 추가 거리. 양방향 동일 가정.') + (o.forecastPlan ? ' 원래 A/B 선택지에서는 0km, 다른 곳으로 바꾸면 추가 거리 적용' : ' A는 0km 가정'));
     add('신규 충전시간', o.durationMode === 'power' ? '충전량 ÷ 대표 출력 × 60분' : '20~40분 균등분포', '가정값', '간소화 모델. 충전효율·충전곡선·출력 공유 제외');
     add('초기 잔여 충전시간', o.durationMode === 'power' ? '0~(충전량 ÷ 대표 출력 × 60)분 균등분포' : '0~30분 균등분포', '가정값', '초기 차량의 실제 잔여시간은 관측하지 않음');
     add('도착·선택 모형', o.forecastPlan ? '구간·원래 선택지별 포아송 건수 + 구간 내 균등 도착 · 로짓 재선택' : '기간 내 균등 도착 · 로짓 선택', '가정값', '취소·포기·추가 이동시간 제외. 행동모델 실측 보정 전');
@@ -459,5 +467,5 @@
     }
     return rows;
   }
-  return { defaults, energyProfile, energyDefault, behaviorProfiles, behaviorReference, behaviorKeys, behaviorConversion, behaviorMatch, compareBehavior, policies, demo, rng, status, price, probability, validate, population, runPolicy, loadProfile, compare, forecast, forecastV2, poisson, sweep, sweepKeys, evidence };
+  return { defaults, energyProfile, energyDefault, behaviorProfiles, behaviorReference, behaviorKeys, behaviorConversion, behaviorMatch, compareBehavior, policies, demo, rng, status, price, probability, validate, population, runPolicy, diversionDistance, loadProfile, compare, forecast, forecastV2, poisson, sweep, sweepKeys, evidence };
 });

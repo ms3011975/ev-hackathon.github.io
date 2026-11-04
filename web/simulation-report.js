@@ -80,7 +80,7 @@
       <p class="sim-note">가정 기반 시뮬레이션 · 15분 평균 등가 충전 부하 · 실제 배전망 측정 결과 아님</p>
       <p>${esc(c.source)} · ${esc(c.region)}<br>실행 시각: ${esc(kst(c.executedAt || '기록 없음'))}<br>요금 근거: ${esc(c.pricingBasis)} ${esc(c.forecastInfo)}<br>A: ${esc(result.stations[0].name)} (${esc(result.stations[0].id)}) / B: ${esc(result.stations[1].name)} (${esc(result.stations[1].id)})<br>신규 ${fmt(o.drivers,3)}명${o.forecastPlan?' (기대값)':''} · 도착 ${fmt(o.minutes)}분 · 차량당 ${o.energy}kWh · ${o.repeats}회 · 시드 ${o.seed}</p>
       ${o.forecastPlan ? `<p class="sim-status">생성 평균 ${fmt(result.population.mean,3)}명 · 범위 ${result.population.min}~${result.population.max}명 · 신규 0명 반복 ${result.population.emptyRuns}/${o.repeats}회. 대기시간·비용·거리는 전체 생성 차량을 기준으로 집계합니다. 모든 반복이 0명이라면 선택·대기·비용의 0은 효과 측정값을 의미하지 않습니다.</p>` : ''}
-      ${forecastTable(result)}
+      ${roadNotice(o,c)}${forecastTable(result)}
       ${overRated ? '<p class="sim-status" data-error="true">충전량과 가정 충전시간으로 계산한 등가 전력이 대표 출력을 넘는 차량이 있습니다. 현재 결과는 에너지 보존 시나리오이며 물리적으로 가능한 부하로 해석할 수 없습니다. 신규 차량 충전시간을 ‘충전량 ÷ 대표 출력’으로 바꾸어 다시 실행하세요.</p>' : '<p class="sim-note">신규 차량은 충전량÷소요시간의 일정 전력, 초기 차량은 대표 출력×가정 잔여시간으로 계산합니다. 실제 충전곡선·효율·출력 공유·비충전 부하는 제외합니다.</p>'}
       <div class="sim-table-wrap"><table class="sim-table"><caption>각 반복에서 지표를 계산한 뒤 평균 · 피크 저감률은 양수=감소, 음수=증가</caption><thead><tr><th>지표</th>${results.map(r=>`<th>${esc(r.label)}</th>`).join('')}</tr></thead><tbody>${metrics.map(([label,get])=>`<tr><th scope="row">${label}</th>${results.map(r=>`<td>${fmt(get(r))}</td>`).join('')}</tr>`).join('')}</tbody></table></div>
       <div class="sim-report-findings">${results.slice(1).map(r=>`<p><strong>${esc(r.label)}</strong>: 고정요금 대비 A 피크 저감률 ${pct(r.load.stationPeakReductionPct[0])}, B ${pct(r.load.stationPeakReductionPct[1])}, 합산 ${pct(r.load.combinedPeakReductionPct)}. 합산 피크 차이는 ${fmt(r.load.combinedPeakDeltaKw)}kW이고, 평균 대기 차이는 ${fmt(r.wait-results[0].wait)}분입니다.</p>`).join('')}</div>
@@ -91,6 +91,10 @@
   }
   const styles = `body{font:15px/1.7 system-ui,sans-serif;color:#213b31;max-width:1100px;padding:28px;margin:auto}h1{font-size:25px}h3{font-size:20px}p{overflow-wrap:anywhere}.sim-table-wrap{overflow-x:auto}.sim-table{border-collapse:collapse;width:100%;font-size:13px;white-space:nowrap}.sim-table th,.sim-table td{padding:10px;border:1px solid #d7e2db;text-align:right}.sim-table th:first-child{text-align:left}.sim-table caption{text-align:left;padding:12px 0}.sim-table thead{background:#eef5ef}.sim-evidence-table{white-space:normal}.sim-evidence-table td{text-align:left}.sim-note{font-size:12px;color:#53695d}.sim-status{padding:12px;background:#fff0e9}.sim-load-chart{margin:22px 0}.sim-load-chart svg{display:block;width:100%;max-height:300px}.sim-load-legend{display:flex;gap:20px;flex-wrap:wrap}.sim-load-legend span:nth-child(1){color:#536474}.sim-load-legend span:nth-child(2){color:#245d4b}.sim-load-legend span:nth-child(3){color:#a66a17}@media print{body{padding:0;font-size:11px}.sim-load-chart, tr{break-inside:avoid}details{display:block}details>div{display:block!important}.sim-table{font-size:9px;white-space:normal}}`;
   const legendStyles = '.sim-load-legend{margin:10px 0;font-size:12px}.sim-load-legend span{display:inline-flex;align-items:center;gap:6px}.sim-load-key{display:inline-block;flex:0 0 22px;width:22px;border-top:3px solid currentColor}.sim-load-chart figcaption{font-weight:600}';
+  function roadNotice(o,c) {
+    if (c.distanceMode!=='road' || !o.roadDistances) return '';
+    return `<p class="sim-note">자동차 도로 거리 A→B ${fmt(o.roadDistances[0],3)}km / B→A ${fmt(o.roadDistances[1],3)}km · 조회 ${esc(kst(c.roadRoute?.fetchedAt || '기록 없음'))}. © <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a> · <a href="https://routing.openstreetmap.de/about.html">FOSSGIS OSRM car</a> · <a href="https://www.openstreetmap.org/">지도 오류 수정</a>. 도로 연결점 기준 경로 추정이며 실제 출입구·교통·전체 우회거리와 다를 수 있습니다. 이동시간은 도착 시각에 더하지 않습니다.</p>`;
+  }
   function behaviorRows(output) {
     const reference = output.profiles[0];
     return output.profiles.flatMap(profile => profile.results.map((r, i) => [
@@ -106,7 +110,7 @@
     const c = output.context || {}, p = output.profiles[0].population;
     return `<p class="sim-note">${esc(c.source || '')} · ${esc(c.region || '')} · 실행 ${esc(kst(c.executedAt || '기록 없음'))}<br>${esc(c.pricingBasis || '')} · ${esc(c.forecastInfo || '')}</p>
       <p>기존 예시값(s=1, α=600, β=300, τ=2000)과 문헌 환산 후보(s=1, α=950, β=360, τ=7200)를 함께 바꿔 비교했습니다. A/B·예측 구간·차량·도착 시각·초기 잔여시간·선택 난수·요금 정책은 공유합니다. 현재 입력한 사용자 행동계수와의 비교는 아닙니다.</p>
-      <p class="sim-note">반복 ${output.base.repeats}회 · 기대 신규 ${fmt(p.expected,3)}명 · 생성 평균 ${fmt(p.mean,3)}명 (${p.min}~${p.max}) · 0명 반복 ${p.emptyRuns}회. 신규 차량이 적으면 선택 비율과 정책 효과 해석에 주의하세요.</p>
+      <p class="sim-note">반복 ${output.base.repeats}회 · 기대 신규 ${fmt(p.expected,3)}명 · 생성 평균 ${fmt(p.mean,3)}명 (${p.min}~${p.max}) · 0명 반복 ${p.emptyRuns}회. 신규 차량이 적으면 선택 비율과 정책 효과 해석에 주의하세요.</p>${roadNotice(output.base,c)}
       <div class="sim-table-wrap"><table class="sim-table"><caption>2개 행동계수 설정 × 3개 요금 정책 · 피크는 15분 평균 부하의 반복별 최대값 평균</caption><thead><tr>${behaviorHeaders.map(h=>`<th scope="col">${esc(h)}</th>`).join('')}</tr></thead><tbody>${behaviorRows(output).map(row=>`<tr>${row.map((v,i)=>i<2?`<th scope="row">${esc(v)}</th>`:`<td>${fmt(v)}</td>`).join('')}</tr>`).join('')}</tbody></table></div>
       <p class="sim-note">피크 저감률은 각 행동계수 설정 안에서 고정요금과 비교합니다. 오른쪽 두 변화 열은 같은 요금 정책에서 행동계수만 바꾼 차이입니다. 피크 차이가 음수이면 문헌 후보에서 더 낮습니다. 가정 민감도 비교이며 문헌 후보의 정확도나 최적 정책을 입증하지 않습니다.</p>`;
   }
