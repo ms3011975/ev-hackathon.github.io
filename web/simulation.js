@@ -82,10 +82,13 @@
       throw new Error('15분 구간·기존 요금 기준·charging_starts 수요 정의가 필요합니다.');
     const timestamp = value => typeof value === 'string' && /(Z|[+-]\d\d:\d\d)$/.test(value) ? Date.parse(value) : NaN;
     const generated = timestamp(payload.generated_at), start = timestamp(payload.simulation_start_at);
-    if (!Number.isFinite(generated) || !Number.isFinite(start) || generated > now + 300000 || now - generated > 5400000 || start < generated || start > now + 300000)
-      throw new Error('v2 생성·시작 시각이 잘못됐거나 생성 후 90분을 넘었습니다. 최신 예측을 불러오세요.');
+    if (!Number.isFinite(generated) || !Number.isFinite(start) || generated > now + 300000 || start < generated || start > now + 300000)
+      throw new Error('v2 생성·시작 시각과 시간대를 확인하세요. 미래 생성 시각은 5분 이내 오차만 허용합니다.');
+    const localTime=t=>new Date(t).toLocaleString('ko-KR',{timeZone:'Asia/Seoul',hourCycle:'h23'});
+    if (now - generated > 5400000)
+      throw new Error(`AI 예측 유효기간 초과: 생성 ${localTime(generated)} (한국 시각), 현재 ${localTime(now)}, ${Math.floor((now-generated)/60000)}분 경과 (허용 90분). 재연결해도 생성 시각이 같으면 원본 모델의 수집·예측·배포 갱신이 필요합니다.`);
     if (!Number.isFinite(observedAt) || observedAt > now + 300000 || now - observedAt > 2700000)
-      throw new Error('v2 연동에는 45분 이내에 수집한 초기 상태가 필요합니다. 실제 데이터를 새로 읽으세요.');
+      throw new Error(`v2 연동에는 45분 이내에 수집한 초기 상태가 필요합니다. 상태 수집 ${Number.isFinite(observedAt)?localTime(observedAt)+' (한국 시각)':'시각 없음'}. 실제 데이터를 새로 읽고, 계속 같은 시각이면 원본 수집·배포 상태를 확인하세요.`);
     const selectedKeys = stations.map(s => s.id + ':' + s.speed), rows = selectedKeys.map(() => new Map());
     for (const row of payload.predictions) {
       const index = selectedKeys.indexOf(row.station_id + ':' + row.speed);
@@ -455,6 +458,9 @@
     }
     for (const [key, label, unit] of [['drivers','신규 운전자','명'],['minutes','도착 생성 기간','분'],['energy','차량당 충전량','kWh'],['sensitivity','가격 민감도','배'],['alpha','이동 비용 α','원/km'],['beta','대기 비용 β','원/분'],['tau','선택 다양성 τ','원']]) {
       const derived = o.forecastPlan && ['drivers','minutes'].includes(key);
+      if(context.demandRequested && !o.forecastPlan && ['drivers','minutes'].includes(key)) {
+        add(label,'AI 예측 연결 필요','연결 필요','v2 계획 검증 전. 이전 수동 숫자를 예측값으로 표시하거나 실행하지 않음');continue;
+      }
       if (behaviorKeys.includes(key)) {
         add(label, `${o[key]}${unit}`, literature ? key === 'sensitivity' ? '실험 설정' : '추정값' : '가정값',
           literature ? key === 'sensitivity' ? '가격계수를 원화 비용 기준 1로 정규화. 한국인 민감도를 추정한 1배가 아님' : '문헌 환산 후보. 위 논문·환산 가정 참조. 같은 네 계수 묶음으로 해석하며 지역·상황 이전 검증 전' : '요구사항 예시 또는 사용자 지정값. 문헌 후보의 한 계수라도 수정하면 네 계수는 사용자 가정 시나리오');

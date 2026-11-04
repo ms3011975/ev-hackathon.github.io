@@ -5,6 +5,7 @@
   let roadState = null, roadTimer;
   const timingClient=window.ESSessionTiming.createClient((url,opts)=>fetch(url,opts));
   let sessionState=null;
+  let forecastLoading=false,forecastFailure='';
   const $ = id => document.getElementById(id), escape = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
   const fmt = (n, d = 1) => Number.isFinite(n) ? n.toLocaleString('ko-KR', { minimumFractionDigits: d, maximumFractionDigits: d }) : '—';
   const kst = value => Number.isFinite(Date.parse(value)) ? new Date(value).toLocaleString('ko-KR',{timeZone:'Asia/Seoul',hourCycle:'h23'})+' (한국 시각)' : String(value ?? '');
@@ -52,18 +53,19 @@
         <label class="sim-note">예측 JSON 파일<input type="file" id="sim-forecast-file" accept=".json,application/json"></label>
         <label class="sim-note" style="display:block;margin-top:10px">예측 JSON URL<input id="sim-forecast-url" type="text" value="${forecastURLs.forecast}" style="width:100%;box-sizing:border-box"></label>
         <button type="button" id="sim-forecast-fetch">URL에서 예측 불러오기</button>
-        <label class="sim-note" style="display:block;margin-top:10px"><input type="checkbox" id="sim-forecast-latest" checked> 실행 시 URL의 최신 예측 다시 읽기 (모델은 30분마다 갱신)</label>
+        <label class="sim-note" style="display:block;margin-top:10px"><input type="checkbox" id="sim-forecast-latest" checked> 실행 시 URL의 최신 예측 다시 읽기 (제공 예정 주기 30분 · 지연 가능)</label>
         <label class="sim-note" style="display:block;margin-top:10px">예측 JSON<textarea id="sim-forecast-json" rows="9" style="width:100%;box-sizing:border-box" placeholder="AI 모델의 실제 출력 JSON을 입력하세요"></textarea></label>
         <p class="sim-note" id="sim-forecast-status" role="status">예측 데이터가 입력되지 않았습니다. 임의 예측값은 생성하지 않습니다.</p>
         <div id="sim-forecast-summary"></div>
       </div></fieldset>
       <div class="sim-actions"><button class="sim-primary" id="sim-run" type="submit">시뮬레이션 실행</button><button id="sim-connect" type="button">AI 수요 모델 연결</button><button id="sim-reload" type="button">데이터 새로 읽기</button></div>
+      <p id="sim-connection-status" class="sim-status" role="status" aria-live="polite" hidden></p>
       <p class="sim-note">가격 민감도 1배에서 C = E×P + α×D + β×W. 민감도는 E×P 항에 곱합니다. 행동계수는 기존·사용자 가정 또는 국외 문헌 이전 추정이며 충북 실측 보정 전입니다. 시간대 배수는 적용하지 않습니다.</p>
     </form><div>
       <div class="sim-card"><h3>02 · 비교할 두 충전소</h3><span class="sim-badge" id="sim-source"></span><div id="sim-message" class="sim-status" role="status" aria-live="polite"></div><div id="sim-stations" class="sim-stations"></div></div>
       <details class="sim-card" id="sim-evidence-box"><summary>입력값의 근거 · 실측값 / 추정값 / 가정값</summary><p class="sim-note">실측·수집값은 수집 시각의 기록입니다. 추정값은 계산·대체 단가·대표 출력·외부 예측을 뜻하며 통계 보정을 완료했다는 뜻은 아닙니다. 가정값은 검증 전 시나리오입니다. 공시요금·정책·반복 설정도 별도로 구분합니다.</p><div id="sim-evidence"></div></details>
       <details class="sim-card"><summary>AI 모델 출력 예시와 연결 범위</summary>
-        <p>현재 연결은 충전소 ID·급속/완속·예측 이용률(0~1), 모델명, 생성 시각, 예측 대상 시각을 받는 버전 1입니다. 이용률은 요금 판정에만 적용합니다.</p>
+        <p>v1은 충전소 ID·급속/완속·예측 이용률(0~1), 모델명, 생성 시각, 예측 대상 시각을 받아 요금 판정에만 적용합니다. ‘AI 수요 모델 연결’은 구간별 이용률·신규 건수를 받는 v2에 연결합니다.</p>
         <p>예: A 이용률 0.8, B 0.2. 이 수치는 형식 설명용이며 실제 예측이 아닙니다. 예시 파일은 example_only=true로 표시하여 실제 모델 출력으로 실행하지 못하게 합니다.</p>
         <button type="button" id="sim-example-output">현재 A/B의 출력 형식 예시 JSON 다운로드</button>
         <p>v2는 제공 모델의 15분 구간 이용률과 예상 충전 시작 건수를 받아 신규 차량을 생성합니다. 실제 도착·대기·포기 차량은 관측하지 않습니다. 충전량과 가격·거리·대기 선호도는 자동 추정하지 않습니다.</p>
@@ -312,7 +314,7 @@
     return { source, executedAt: new Date().toISOString(), region: $('sim-mode').value === 'demo' ? '예시 · 지역 무관' : $('sim-region').selectedOptions[0].text,
       mode: $('sim-mode').value, speed: $('sim-speed').value, distanceMode: $('sim-distanceMode').value, energySource: $('sim-energySource').value, behaviorPreset: $('sim-behaviorPreset').value,
       roadRoute: $('sim-distanceMode').value==='road' && roadState?.status==='ready' ? roadState.result : null,
-      forecastRequested: $('sim-pricingBasis').value !== 'observed',
+      forecastRequested: $('sim-pricingBasis').value !== 'observed',demandRequested:$('sim-pricingBasis').value==='forecast-v2',
       pricingBasis: $('sim-pricingBasis').value === 'forecast-v2' ? 'v2 구간별 예측 요금·충전 시작 건수 기반 수요' : $('sim-pricingBasis').value === 'forecast' ? 'v1 1시간 후 이용률 (요금에만 적용)' : '현재 수집 상태',
       forecastInfo: prediction ? `${prediction.model} · 생성 ${kst(prediction.generatedAt)} · 대상 ${kst(prediction.targetTime)}` : '',
       forecastInput:forecastOrigin,
@@ -323,8 +325,8 @@
   }
   function renderEvidence() {
     if (!$('sim-evidence')) return;
-    let p; try { if ($('sim-pricingBasis').value !== 'observed') p = readForecast(); } catch { /* missing forecast is shown explicitly */ }
-    syncDemand(p);
+    let p,problem=''; try { if ($('sim-pricingBasis').value !== 'observed') p = readForecast(); } catch(e) { problem=forecastFailure || e.message; }
+    syncDemand(p,problem);
     $('sim-evidence').innerHTML = evidenceTable(sim.evidence(selected().filter(Boolean), options(p), context(p)));
   }
   function lock(active) {
@@ -507,6 +509,7 @@
   function readForecast() {
     const stations = selected();
     if (stations.some(s => !s)) throw new Error('먼저 충전소 A/B를 선택하세요.');
+    if(!$('sim-forecast-json').value.trim()) throw new Error('AI 예측 연결 필요: ‘AI 수요 모델 연결’ 또는 ‘URL에서 예측 불러오기’를 누르세요.');
     let payload;
     try { payload = JSON.parse($('sim-forecast-json').value); } catch { throw new Error('예측 JSON 형식을 확인하세요.'); }
     if ($('sim-pricingBasis').value === 'forecast-v2') {
@@ -517,17 +520,30 @@
     }
     return sim.forecast(payload, stations);
   }
-  function syncDemand(prediction) {
+  function syncDemand(prediction,problem='') {
     const derived = $('sim-pricingBasis').value === 'forecast-v2';
     if (derived && !manualDemand) manualDemand = {drivers:$('sim-drivers').value,minutes:$('sim-minutes').value};
     for (const key of ['drivers','minutes']) {
       const input=$('sim-'+key); input.readOnly=derived;
       input.min=derived?'0':'1'; input.step=derived?'any':'1';
-      $('sim-kind-'+key).innerHTML=badge(derived ? prediction?.plan ? '추정값' : '미입력' : '가정값');
-      if (prediction?.plan) input.value=(key==='drivers'?prediction.plan.expectedDrivers:prediction.plan.minutes).toFixed(3);
+      input.required=!derived;
+      input.placeholder=derived?'AI 예측 연결 필요':'';
+      input.setAttribute('aria-invalid',String(derived && !prediction?.plan && !forecastLoading));
+      $('sim-kind-'+key).innerHTML=badge(derived ? prediction?.plan ? '추정값' : forecastLoading ? '불러오는 중' : 'AI 예측 확인 필요' : '가정값');
+      if (derived && prediction?.plan) input.value=(key==='drivers'?prediction.plan.expectedDrivers:prediction.plan.minutes).toFixed(3);
+      else if(derived) input.value='';
       else if (!derived && manualDemand) input.value=manualDemand[key];
     }
     if (!derived) manualDemand=null;
+    const panel=$('sim-connection-status'), requested=$('sim-pricingBasis').value!=='observed';
+    panel.hidden=!requested;panel.dataset.error=String(requested && !prediction && !forecastLoading);
+    if(requested){
+      let generated='';try{const p=JSON.parse($('sim-forecast-json').value);if(p.generated_at)generated=` 수신한 예측 생성 시각: ${kst(p.generated_at)}.`;}catch{/* no payload yet */}
+      const text=forecastLoading?'AI 예측과 상태를 확인하는 중입니다…':prediction?`AI 예측 검증 완료.${generated}${derived?' 신규 인원·기간은 자동 추정값입니다.':' v1은 요금에만 적용하며 인원·기간은 수동입니다.'}`:
+        `${problem || 'AI 예측 연결 필요.'}${generated} ${derived?'신규 인원·기간은 비워 두었습니다. 이전 숫자로 실행하지 않습니다. ':''}최신 자료 갱신 후 재연결하거나 ‘현재 수집 상태 + 수동 수요’로 바꾸어 가정 실험을 하세요.`;
+      panel.textContent=text;
+      if(!prediction){$('sim-forecast-status').textContent=text;$('sim-forecast-summary').innerHTML='';}
+    }
     $('sim-distance').parentElement.firstChild.textContent='A→B 차량 이동거리 (km)';
     $('sim-distanceMode').options[0].textContent='자동차 도로 이동거리 · 방향별 자동 조회';
     $('sim-distanceMode').options[1].textContent='사용자 입력 거리 · 양방향 동일 가정';
@@ -545,13 +561,15 @@
       <p class="sim-note">초기 상태 수집: ${escape(kst(plan.observedAt))}. kWh·행동계수는 AI 모델에 없어 화면에서 선택한 별도 추정값 또는 사용자 가정을 유지합니다. 완료 기록 모드를 선택하면 별도로 조회한 원기록 분포를 충전시간에 적용하며, 아래에서 표본과 대체 여부를 확인할 수 있습니다.</p>`;
   }
   function checkForecast() {
+    forecastFailure='';
     invalidate();
     try {
       const p = readForecast();
       showForecast(p);
-    } catch (error) { $('sim-forecast-status').textContent = error.message; $('sim-forecast-summary').innerHTML=''; }
+    } catch (error) { syncDemand(undefined,error.message); }
   }
   function changeBasis() {
+    forecastFailure='';
     forecastRequest++; $('sim-forecast-json').value=''; forecastOrigin='';
     $('sim-forecast-url').value=forecastURLs[$('sim-pricingBasis').value] || forecastURLs.forecast;
     $('sim-forecast-latest').checked=true;
@@ -569,7 +587,7 @@
   });
   async function fetchForecast() {
     const request=++forecastRequest, basis=$('sim-pricingBasis').value;
-    const button = $('sim-forecast-fetch'); button.disabled = true;
+    const button = $('sim-forecast-fetch'); button.disabled = true;forecastLoading=true;forecastFailure='';
     // Clear previous input so a failed fetch cannot silently reuse another forecast.
     $('sim-forecast-json').value = ''; forecastOrigin=''; invalidate();
     $('sim-forecast-status').textContent = '예측 JSON을 읽는 중입니다…';
@@ -584,8 +602,8 @@
       $('sim-forecast-json').value = body;
       forecastOrigin='URL '+url.href;
       const prediction=readForecast(); showForecast(prediction); renderEvidence(); return prediction;
-    } catch (error) { $('sim-forecast-status').textContent = error.message; throw error; }
-    finally { button.disabled = false; }
+    } catch (error) { forecastFailure=error.message; $('sim-forecast-status').textContent = error.message; throw error; }
+    finally { forecastLoading=false;button.disabled = false;renderEvidence(); }
   }
   $('sim-forecast-fetch').addEventListener('click', async () => {try {await fetchForecast();} catch { /* status already shown */ }});
   async function preparePrediction() {
@@ -604,12 +622,12 @@
   $('sim-connect').addEventListener('click', async () => {
     if (busy) return;
     const preserve=$('sim-mode').value==='real';
-    lock(true);
+    lock(true);forecastLoading=true;forecastFailure='';
     try {
       $('sim-mode').value='real'; $('sim-pricingBasis').value='forecast-v2'; changeBasis();
       await load({preserveSelection:preserve}); lock(true);
       await fetchForecast(); message('AI 수요 모델 연결 완료. 구간별 기대 건수와 가정값을 확인한 뒤 시뮬레이션을 실행하세요.');
-    } catch(error) {message(error.message,true);} finally {lock(false);}
+    } catch(error) {forecastFailure=error.message;message(error.message,true);} finally {forecastLoading=false;renderEvidence();lock(false);}
   });
   $('sim-form').addEventListener('change', invalidate);
   $('sim-energySource').addEventListener('change', ()=>{updateEnergy();invalidate();});

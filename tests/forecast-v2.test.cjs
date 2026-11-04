@@ -15,6 +15,16 @@ function fixture() {
 const parse=payload=>sim.forecastV2(payload,sim.demo(),{now,observedAt:now-60000});
 function options(prediction, extra={}) {return {...sim.defaults,drivers:prediction.plan.expectedDrivers,minutes:prediction.plan.minutes,forecastPlan:prediction.plan,repeats:10,...extra};}
 
+test('expired v2 identifies upstream generation age and never relabels old demand as current',()=>{
+  assert.throws(()=>sim.forecastV2(fixture(),sim.demo(),{now:start+91*60000,observedAt:start+91*60000}),e=>
+    /AI 예측 유효기간 초과/.test(e.message)&&/91분/.test(e.message)&&/허용 90분/.test(e.message)&&/원본 모델/.test(e.message));
+  assert.throws(()=>sim.forecastV2(fixture(),sim.demo(),{now,observedAt:now-46*60000}),/상태 수집.*원본 수집/);
+  const e=sim.evidence(sim.demo(),{...sim.defaults,drivers:0,minutes:0},{demandRequested:true});
+  for(const label of ['신규 운전자','도착 생성 기간']){
+    const row=e.find(r=>r.item===label);assert.equal(row.kind,'연결 필요');assert.equal(row.value,'AI 예측 연결 필요');
+  }
+});
+
 test('behavior presets share fractional v2 demand, quotes and initial energy including zero demand',async()=>{
   for(const zero of [false,true]){
     const raw=fixture(); if(zero) raw.predictions.forEach(r=>r.expected_new_sessions=0);
