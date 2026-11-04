@@ -3,6 +3,7 @@
   const sim = window.ESSimulation, config = JSON.parse(document.getElementById('sim-config').textContent);
   const $ = id => document.getElementById(id), escape = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
   const fmt = (n, d = 1) => Number.isFinite(n) ? n.toLocaleString('ko-KR', { minimumFractionDigits: d, maximumFractionDigits: d }) : '—';
+  const kst = value => Number.isFinite(Date.parse(value)) ? new Date(value).toLocaleString('ko-KR',{timeZone:'Asia/Seoul',hourCycle:'h23'})+' (한국 시각)' : String(value ?? '');
   const fields = [
     ['drivers', '신규 운전자 (명)', 24, 1, 500, 1], ['minutes', '도착 생성 기간 (분)', 60, 1, 1440, 1],
     ['discount', '여유 할인율 (%)', config.discount * 100, 0, 100, 1], ['surcharge', '혼잡 할증율 (%)', config.surcharge * 100, 0, 100, 1],
@@ -16,7 +17,8 @@
   const badge = kind => `<span class="sim-kind" data-kind="${escape(kind)}">${escape(kind)}</span>`;
   const fieldKind = key => policiesFields.has(key) ? '정책 설정' : experimentFields.has(key) ? '실험 설정' : '가정값';
   const sweepFields = fields.filter(([key]) => !experimentFields.has(key));
-  let pool = [], last = null, lastSweep = null, busy = false, cancelSweep = false, source = '예시 데이터', dataVersion = 0;
+  const forecastURLs = {forecast:'https://ev-hackathon.github.io/data/forecast.json', 'forecast-v2':'https://ev-hackathon.github.io/data/forecast_v2.json'};
+  let pool = [], last = null, lastSweep = null, busy = false, cancelSweep = false, source = '예시 데이터', sourceWhen = '', dataVersion = 0, forecastRequest = 0, manualDemand = null, forecastOrigin = '';
   $('simulation-view').innerHTML = `
     <span class="sim-kicker">ESSENTIAL · DEMAND LAB</span>
     <h2>요금이 바뀌면, 충전 수요는 어디로 갈까요?</h2>
@@ -31,17 +33,19 @@
         ${fields.map(([id, label, value, min, max, step]) => `<label>${label}<span id="sim-kind-${id}">${badge(id === 'distance' ? '추정값' : fieldKind(id))}</span><input id="sim-${id}" type="number" value="${value}" min="${min}" max="${max}" step="${step}" required></label>`).join('')}
         <label class="sim-wide">추가 거리 산정<select id="sim-distanceMode"><option value="coords">A↔B 좌표 직선거리 (A: 0km)</option><option value="manual">사용자 가정값 (A: 0km, B: 입력값)</option></select></label>
         <label class="sim-wide">신규 차량 충전시간 ${badge('가정값')}<select id="sim-durationMode"><option value="power"${sim.defaults.durationMode === 'power' ? ' selected' : ''}>충전량 ÷ 대표 출력 × 60분 (기본)</option><option value="assumed"${sim.defaults.durationMode === 'assumed' ? ' selected' : ''}>20~40분 균등분포 (간소화 가정)</option></select></label>
-        <label class="sim-wide">요금 판정 기준<select id="sim-pricingBasis"><option value="observed">현재 수집 상태</option><option value="forecast">외부 AI 모델 예측 이용률</option></select></label>
+        <label class="sim-wide">요금·수요 기준<select id="sim-pricingBasis"><option value="observed">현재 수집 상태 + 수동 수요</option><option value="forecast">AI 1시간 후 이용률 + 수동 수요 (v1)</option><option value="forecast-v2">AI 15분 구간 이용률·신규 건수 (v2)</option></select></label>
       </div>
       <div id="sim-forecast-panel" hidden>
-        <p class="sim-note">모델이 만든 JSON을 파일·URL·붙여넣기로 입력하세요. A/B의 동일한 종류 예측이 모두 필요합니다. 예측 이용률은 요금에만 적용하며 초기 대기열은 실제 수집 상태를 유지합니다.</p>
+        <p class="sim-note">v1은 1시간 후 이용률로 요금만 정합니다. v2는 남은 15분 구간별 요금과 신규 차량 생성을 연결합니다. 초기 점유는 수집 상태를 사용하며 kWh·행동계수는 가정값입니다.</p>
         <label class="sim-note">예측 JSON 파일<input type="file" id="sim-forecast-file" accept=".json,application/json"></label>
-        <label class="sim-note" style="display:block;margin-top:10px">예측 JSON URL<input id="sim-forecast-url" type="text" value="data/forecast.json" style="width:100%;box-sizing:border-box"></label>
+        <label class="sim-note" style="display:block;margin-top:10px">예측 JSON URL<input id="sim-forecast-url" type="text" value="${forecastURLs.forecast}" style="width:100%;box-sizing:border-box"></label>
         <button type="button" id="sim-forecast-fetch">URL에서 예측 불러오기</button>
+        <label class="sim-note" style="display:block;margin-top:10px"><input type="checkbox" id="sim-forecast-latest" checked> 실행 시 URL의 최신 예측 다시 읽기 (모델은 30분마다 갱신)</label>
         <label class="sim-note" style="display:block;margin-top:10px">예측 JSON<textarea id="sim-forecast-json" rows="9" style="width:100%;box-sizing:border-box" placeholder="AI 모델의 실제 출력 JSON을 입력하세요"></textarea></label>
         <p class="sim-note" id="sim-forecast-status" role="status">예측 데이터가 입력되지 않았습니다. 임의 예측값은 생성하지 않습니다.</p>
+        <div id="sim-forecast-summary"></div>
       </div></fieldset>
-      <div class="sim-actions"><button class="sim-primary" id="sim-run" type="submit">시뮬레이션 실행</button><button id="sim-reload" type="button">데이터 새로 읽기</button></div>
+      <div class="sim-actions"><button class="sim-primary" id="sim-run" type="submit">시뮬레이션 실행</button><button id="sim-connect" type="button">AI 수요 모델 연결</button><button id="sim-reload" type="button">데이터 새로 읽기</button></div>
       <p class="sim-note">가격 민감도 1배에서 C = E×P + α×D + β×W. 민감도는 E×P 항에 곱합니다. 모든 행동계수는 실측값이 아닌 가정입니다. 시간대 배수는 적용하지 않습니다.</p>
     </form><div>
       <div class="sim-card"><h3>02 · 비교할 두 충전소</h3><span class="sim-badge" id="sim-source"></span><div id="sim-message" class="sim-status" role="status" aria-live="polite"></div><div id="sim-stations" class="sim-stations"></div></div>
@@ -50,7 +54,7 @@
         <p>현재 연결은 충전소 ID·급속/완속·예측 이용률(0~1), 모델명, 생성 시각, 예측 대상 시각을 받는 버전 1입니다. 이용률은 요금 판정에만 적용합니다.</p>
         <p>예: A 이용률 0.8, B 0.2. 이 수치는 형식 설명용이며 실제 예측이 아닙니다. 예시 파일은 example_only=true로 표시하여 실제 모델 출력으로 실행하지 못하게 합니다.</p>
         <button type="button" id="sim-example-output">현재 A/B의 출력 형식 예시 JSON 다운로드</button>
-        <p>후속 버전 2 계약안은 15분 구간 시작·종료, 기준 이용률, 예상 신규 도착 건수를 추가합니다. 건별 이력이 있으면 건당 충전량·소요시간도 보완할 수 있습니다. 버전 2 자동 적용은 아직 지원하지 않습니다.</p>
+        <p>v2는 제공 모델의 15분 구간 이용률과 예상 충전 시작 건수를 받아 신규 차량을 생성합니다. 실제 도착·대기·포기 차량은 관측하지 않습니다. 충전량과 가격·거리·대기 선호도는 자동 추정하지 않습니다.</p>
         <p><a href="https://github.com/ms3011975/ev-hackathon.github.io/blob/main/docs/simulation-report.md" target="_blank" rel="noopener">팀 공유용 출력 JSON 예시와 분석 리포트 설명</a></p>
       </details>
       <progress id="sim-progress" max="1" value="0" hidden aria-label="시뮬레이션 진행률"></progress>
@@ -74,9 +78,9 @@
         <div id="sim-sweep-results"></div>
       </section>
       <details class="sim-card"><summary>모델 가정과 결과 읽는 방법</summary>
-        <p>운전자의 도착 시각은 입력한 기간 내 균등분포로 생성합니다. A를 원래 목적지로 가정해 추가 거리 0km, B는 입력값 또는 충전소 간 직선거리를 사용합니다. 이동 소요시간은 따로 더하지 않으며 선택과 충전소 도착은 같은 시각에 처리합니다.</p>
+        <p>수동 수요는 기간 내 균등 도착이며 A를 원래 목적지로 둡니다. v2는 충전소·구간별 기대 충전 시작 건수를 평균으로 하는 독립 포아송 건수와 구간 내 균등 도착을 가정합니다. 원래 선택지는 A/B별로 보존하고 다른 충전소로 바꿀 때만 추가 거리를 적용합니다. 이동 소요시간은 따로 더하지 않습니다.</p>
         <p>기본 충전시간은 충전량÷대표 출력×60분이며 초기 차량 잔여시간은 0~해당 시간의 균등분포입니다. 선택 가능한 20~40분 가정 모드에서는 초기 잔여시간을 0~30분으로 둡니다. 충전효율·배터리 충전곡선·출력 공유는 반영하지 않습니다. 혼합 출력 충전소는 기존 관제의 대표 출력·단가를 동일하게 적용합니다.</p>
-        <p>판정 분모는 빈 충전기+충전 중이며 고장·미확인 충전기는 처리 능력에서 제외합니다. 요금 기준은 현재 상태 또는 외부 예측 이용률로 선택합니다. 예측 모드에서도 초기 점유는 실제 수집 상태이며 요금만 예측값으로 고정합니다. 예측 대상 미래 시점의 대기열을 복원하는 기능은 없습니다. AI 예측값을 임의 생성하지 않습니다.</p>
+        <p>판정 분모는 빈 충전기+충전 중이며 고장·미확인 충전기는 처리 능력에서 제외합니다. 수동/v1 요금은 고정하고 v2는 각 도착 구간의 예측 이용률로 요금을 정합니다. 요금표는 시간가중 평균 단가이며 차량은 선택 시 단가를 충전 종료까지 적용합니다. 초기 점유는 수집 상태이며 미래 대기열을 복원하지 않습니다.</p>
         <p>선택 당시 예상 대기는 이미 도착한 차량을 포함한 가장 빠른 충전기 사용 가능 시각으로 계산합니다. 실제 대기는 도착순 FIFO 예약 후 계산합니다. 같은 정보와 변경 없는 대기열을 사용하는 이 모델에서는 두 값이 일치합니다. 기간 내 도착한 모든 신규 차량을 충전 완료까지 집계하며 초기 차량의 요금은 제외합니다.</p>
         <p>결과는 반복 1회당 평균입니다. 평균 대기의 표준오차(SE)는 반복 실험 간 변동이며 실세계 예측 오차가 아닙니다. 총 할인 혜택은 기본 단가 대비 할인액의 합으로 사업자 순손실과 다릅니다. 수입 차이는 정책별 선택 충전소와 단가로 계산한 단순 매출 차이이며 비용을 반영하지 않습니다.</p>
       </details>
@@ -122,7 +126,9 @@
     cards(); $('sim-run').disabled = pool.length < 2;
     return a && sim.status(a, threshold) === '혼잡' && candidates.length > 0;
   }
-  async function load() {
+  async function load({preserveSelection = false} = {}) {
+    const previous = selected().map(s=>s?.id);
+    sourceWhen = '';
     const version = ++dataVersion; invalidate();
     $('sim-run').disabled = true; $('sim-reload').disabled = true;
     try {
@@ -141,26 +147,33 @@
         const data = await window.ESSMonitor.stations($('sim-region').value);
         if (version !== dataVersion) return;
         source = `실제 수집 데이터 · ${data.when || '수집 시각 미제공'} · ${data.dataSource ? 'ev-hackathon 공개 저장본' : data.kind === 'snapshot' ? '저장본' : '마지막 수집 상태'}`;
+        sourceWhen = data.when || '';
         const pair = choosePool(data.list.map(s => ({ id: s.id, name: s.name, lat: s.lat, lng: s.lng, speed,
           ...s[speed], unknown: s[speed].total - s[speed].avail - s[speed].charging - s[speed].fault, source: s[speed].src || '기존 운영사 요금표' })));
         message(pool.length < 2 ? '동일 종류의 처리 가능한 충전소가 2곳 미만입니다. 예시 데이터 모드로 전환해 주세요.' : pair ? '같은 종류의 혼잡 A와 가장 가까운 여유 B를 선택했습니다. 다른 충전소도 직접 선택할 수 있습니다. 거리는 별도 설정을 확인하세요.' : '혼잡 A·여유 B 조건에 맞는 쌍이 없습니다. 비교 가능한 두 거점을 표시했습니다. 예시 데이터 모드도 사용할 수 있습니다.');
+      }
+      if (preserveSelection) {
+        for (const [i,id] of previous.entries()) if (pool.some(s=>s.id===id)) $('sim-'+(i?'b':'a')).value=id;
+        cards();
       }
     } catch (error) {
       if (version === dataVersion) { source = '실제 데이터 없음'; choosePool([]); message(error.message + ' 예시 데이터 모드를 선택하면 데모를 실행할 수 있습니다.', true); }
     } finally { if (version === dataVersion) $('sim-reload').disabled = false; }
   }
-  function options() {
+  function options(prediction) {
     const o = Object.fromEntries(fields.map(([key]) => [key, +$('sim-' + key).value]));
     for (const k of ['discount', 'surcharge', 'threshold']) o[k] /= 100;
     o.durationMode = $('sim-durationMode').value;
+    if (prediction?.plan) Object.assign(o,{drivers:prediction.plan.expectedDrivers,minutes:prediction.plan.minutes,forecastPlan:prediction.plan});
     return o;
   }
   function context(prediction) {
     return { source, executedAt: new Date().toISOString(), region: $('sim-mode').value === 'demo' ? '예시 · 지역 무관' : $('sim-region').selectedOptions[0].text,
       mode: $('sim-mode').value, speed: $('sim-speed').value, distanceMode: $('sim-distanceMode').value,
-      forecastRequested: $('sim-pricingBasis').value === 'forecast',
-      pricingBasis: $('sim-pricingBasis').value === 'forecast' ? '외부 모델의 예측 이용률 (요금에만 적용)' : '현재 수집 상태',
-      forecastInfo: prediction ? `${prediction.model} · 생성 ${prediction.generatedAt} · 대상 ${prediction.targetTime}` : '',
+      forecastRequested: $('sim-pricingBasis').value !== 'observed',
+      pricingBasis: $('sim-pricingBasis').value === 'forecast-v2' ? 'v2 구간별 예측 요금·충전 시작 건수 기반 수요' : $('sim-pricingBasis').value === 'forecast' ? 'v1 1시간 후 이용률 (요금에만 적용)' : '현재 수집 상태',
+      forecastInfo: prediction ? `${prediction.model} · 생성 ${kst(prediction.generatedAt)} · 대상 ${kst(prediction.targetTime)}` : '',
+      forecastInput:forecastOrigin,
       forecastUtilizationA: prediction?.utilizationById[selected()[0]?.id] ?? '', forecastUtilizationB: prediction?.utilizationById[selected()[1]?.id] ?? '' };
   }
   function evidenceTable(rows) {
@@ -168,12 +181,14 @@
   }
   function renderEvidence() {
     if (!$('sim-evidence')) return;
-    let p; try { if ($('sim-pricingBasis').value === 'forecast') p = readForecast(); } catch { /* missing forecast is shown explicitly */ }
-    $('sim-evidence').innerHTML = evidenceTable(sim.evidence(selected().filter(Boolean), options(), context(p)));
+    let p; try { if ($('sim-pricingBasis').value !== 'observed') p = readForecast(); } catch { /* missing forecast is shown explicitly */ }
+    syncDemand(p);
+    $('sim-evidence').innerHTML = evidenceTable(sim.evidence(selected().filter(Boolean), options(p), context(p)));
   }
   function lock(active) {
     busy = active; $('sim-controls').disabled = active; $('sim-sweep-controls').disabled = active;
     $('sim-run').disabled = active || pool.length < 2; $('sim-reload').disabled = active;
+    $('sim-connect').disabled = active;
     if (!active) $('sim-region').disabled = $('sim-mode').value === 'demo';
   }
   function render(result) {
@@ -181,7 +196,8 @@
     const maxDiscount = Math.max(1, ...results.map(r => r.discount));
     const bar = (r, value, max, unit) => `<div class="sim-bar-row"><div class="sim-bar-label"><span>${r.label}</span><b>${fmt(value)}${unit}</b></div><div class="sim-track"><div class="sim-fill sim-wait" style="width:${value / max * 100}%"></div></div></div>`;
     $('sim-results').innerHTML = `<div class="sim-card"><h3>03 · 세 정책, 같은 운전자</h3>
-      <p class="sim-note" id="sim-result-state">${escape(result.context.source)} · ${escape(result.context.region)} · 가상 시뮬레이션 결과<br>요금 기준: ${escape(result.context.pricingBasis)}<br>${escape(result.context.forecastInfo || '')}<br>반복 ${o.repeats}회 평균 · 신규 ${o.drivers}명 · 도착 ${o.minutes}분 · ${o.energy}kWh · 시드 ${o.seed} · B 추가 ${fmt(o.distance, 3)}km</p>
+      <p class="sim-note" id="sim-result-state">${escape(result.context.source)} · ${escape(result.context.region)} · 가상 시뮬레이션 결과<br>요금 기준: ${escape(result.context.pricingBasis)}<br>${escape(result.context.forecastInfo || '')}<br>반복 ${o.repeats}회 · 신규 ${o.forecastPlan ? `기대 ${fmt(o.drivers,3)}명 / 생성 평균 ${fmt(result.population.mean,3)}명 (${result.population.min}~${result.population.max})` : o.drivers+'명'} · 도착 ${fmt(o.minutes,2)}분 · ${o.energy}kWh · 시드 ${o.seed} · 대체 거리 ${fmt(o.distance, 3)}km</p>
+      ${o.forecastPlan ? `<p class="sim-note">신규 0명 반복 ${result.population.emptyRuns}/${o.repeats}회. 선택 비율·대기·요금·거리는 전체 생성 차량을 기준으로 집계합니다. 표의 단가는 시간가중 평균이며 각 차량은 도착 구간 단가를 적용합니다. 구간별 단가와 수요는 아래 분석 리포트에 기록합니다.</p>` : ''}
       <div class="sim-table-wrap"><table class="sim-table"><caption>정책별 비교 (반복 1회당 평균)</caption><thead><tr><th>지표</th>${results.map(r => `<th scope="col">${r.label}</th>`).join('')}</tr></thead><tbody>
       ${[
         ['A 적용 단가 (원/kWh)', r => fmt(r.prices[0])], ['B 적용 단가 (원/kWh)', r => fmt(r.prices[1])],
@@ -213,7 +229,7 @@
     downloadRows(`essential-simulation-${o.seed}.csv`, rows);
   }
   function downloadRows(filename, rows) {
-    const cell = value => { const text = String(value ?? ''); return '"' + (/^[=+@-]/.test(text) && !Number.isFinite(Number(text)) ? "'" : '') + text.replace(/"/g, '""') + '"'; };
+    const cell = value => { const text = value!==null && typeof value==='object' ? JSON.stringify(value) : String(value ?? ''); return '"' + (/^[=+@-]/.test(text) && !Number.isFinite(Number(text)) ? "'" : '') + text.replace(/"/g, '""') + '"'; };
     downloadFile(filename, '\ufeff' + rows.map(row => row.map(cell).join(',')).join('\r\n'), 'text/csv;charset=utf-8');
   }
   function downloadFile(filename, text, type) {
@@ -290,12 +306,13 @@
       const key = $('sim-sweep-key').value, parts = $('sim-sweep-values').value.split(',').map(s=>s.trim());
       if (parts.some(s=>!s)) throw new Error('쉼표로 구분한 비교값을 입력하세요. 빈 값은 사용할 수 없습니다.');
       const values = key === 'durationMode' ? parts : parts.map(v => Number(v) / (policiesFields.has(key) ? 100 : 1));
-      const prediction = $('sim-pricingBasis').value === 'forecast' ? readForecast() : null;
-      const capturedContext = context(prediction), capturedOptions = options();
+      const prediction = await preparePrediction();
+      const capturedContext = context(prediction), capturedOptions = options(prediction);
+      const currentStations = selected().map(s=>({...s}));
       if (lastSweep) $('sim-sweep-export').disabled = true;
-      const output = await sim.sweep(stations, capturedOptions, key, values, p => { $('sim-sweep-status').textContent = `민감도 분석 중… ${Math.round(p*100)}%`; }, prediction?.utilizationById, () => cancelSweep);
-      output.context = capturedContext; output.evidence = sim.evidence(stations,capturedOptions,capturedContext);
-      for (const level of output.scenarios) level.evidence = sim.evidence(stations,level.options,{...capturedContext,distanceMode:key === 'distance' && level.value !== output.baseline ? 'manual' : capturedContext.distanceMode});
+      const output = await sim.sweep(currentStations, capturedOptions, key, values, p => { $('sim-sweep-status').textContent = `민감도 분석 중… ${Math.round(p*100)}%`; }, prediction?.utilizationById, () => cancelSweep);
+      output.context = capturedContext; output.evidence = sim.evidence(currentStations,capturedOptions,capturedContext);
+      for (const level of output.scenarios) level.evidence = sim.evidence(currentStations,level.options,{...capturedContext,distanceMode:key === 'distance' && level.value !== output.baseline ? 'manual' : capturedContext.distanceMode});
       lastSweep = output; renderSweep(output);
       $('sim-sweep-status').textContent = `완료 · ${output.scenarios.length}개 수준 × 3개 정책. 결과는 가상 시나리오 비교입니다.`;
     } catch (error) { $('sim-sweep-status').textContent = error.message; }
@@ -308,12 +325,8 @@
     lock(true); $('sim-progress').hidden = false;
     message('세 정책에 동일한 운전자를 적용해 계산하고 있습니다…');
     try {
-      let prediction = null;
-      if ($('sim-pricingBasis').value === 'forecast') {
-        prediction = readForecast();
-        $('sim-forecast-status').textContent = `${prediction.model} · 대상 ${prediction.targetTime} · A ${(prediction.utilizationById[stations[0].id] * 100).toFixed(1)}%, B ${(prediction.utilizationById[stations[1].id] * 100).toFixed(1)}%`;
-      }
-      const result = await sim.compare(stations, options(), p => { $('sim-progress').value = p; }, prediction?.utilizationById);
+      const prediction = await preparePrediction();
+      const result = await sim.compare(selected(), options(prediction), p => { $('sim-progress').value = p; }, prediction?.utilizationById);
       result.context = context(prediction);
       result.evidence = sim.evidence(result.stations, result.options, result.context);
       last = result; render(result); message('계산 완료. 아래 결과는 가상 운전자 모의실험이며 실제 관측 성과가 아닙니다.');
@@ -326,44 +339,111 @@
     if (stations.some(s => !s)) throw new Error('먼저 충전소 A/B를 선택하세요.');
     let payload;
     try { payload = JSON.parse($('sim-forecast-json').value); } catch { throw new Error('예측 JSON 형식을 확인하세요.'); }
+    if ($('sim-pricingBasis').value === 'forecast-v2') {
+      if ($('sim-mode').value !== 'real') throw new Error('v2는 실제 공공데이터 모드의 충전소를 선택하세요.');
+      const kst = String(sourceWhen).replace(' ','T');
+      const observedAt = Date.parse(/(Z|[+-]\d\d:\d\d)$/.test(kst) ? kst : kst+'+09:00');
+      return sim.forecastV2(payload,stations,{observedAt});
+    }
     return sim.forecast(payload, stations);
+  }
+  function syncDemand(prediction) {
+    const derived = $('sim-pricingBasis').value === 'forecast-v2';
+    if (derived && !manualDemand) manualDemand = {drivers:$('sim-drivers').value,minutes:$('sim-minutes').value};
+    for (const key of ['drivers','minutes']) {
+      const input=$('sim-'+key); input.readOnly=derived;
+      input.min=derived?'0':'1'; input.step=derived?'any':'1';
+      $('sim-kind-'+key).innerHTML=badge(derived ? prediction?.plan ? '추정값' : '미입력' : '가정값');
+      if (prediction?.plan) input.value=(key==='drivers'?prediction.plan.expectedDrivers:prediction.plan.minutes).toFixed(3);
+      else if (!derived && manualDemand) input.value=manualDemand[key];
+    }
+    if (!derived) manualDemand=null;
+    $('sim-distance').parentElement.firstChild.textContent=derived?'대체 충전소 추가 거리 (km)':'B 추가 거리 (km)';
+    $('sim-distanceMode').options[0].textContent=derived?'A↔B 좌표 직선거리 (선택 변경 시)':'A↔B 좌표 직선거리 (A: 0km)';
+    $('sim-distanceMode').options[1].textContent=derived?'사용자 가정값 (선택 변경 시)':'사용자 가정값 (A: 0km, B: 입력값)';
+    for (const option of $('sim-sweep-key').options) if (['drivers','minutes'].includes(option.value)) option.disabled=derived;
+    if (derived && ['drivers','minutes'].includes($('sim-sweep-key').value)) { $('sim-sweep-key').value='discount'; presetSweep(); }
+  }
+  function showForecast(prediction) {
+    syncDemand(prediction);
+    const plan=prediction.plan;
+    $('sim-forecast-status').textContent=`검증 완료 · ${prediction.model} · 생성 ${kst(prediction.generatedAt)} · 대상 ${kst(prediction.targetTime)}`;
+    if (!plan) { $('sim-forecast-summary').innerHTML='<p class="sim-note">v1 이용률은 요금에만 반영합니다. 신규 인원·기간은 수동 설정입니다.</p>'; return; }
+    const time=value=>new Date(value).toLocaleTimeString('ko-KR',{timeZone:'Asia/Seoul',hour:'2-digit',minute:'2-digit'});
+    $('sim-forecast-summary').innerHTML=`<p class="sim-note">실행 시각부터 남은 ${fmt(plan.minutes,2)}분 · 기대 신규 ${fmt(plan.expectedDrivers,3)}건. 실제 도착 인원 실측이 아닌 충전 시작 건수 추정으로, 반복마다 포아송 차량을 생성합니다. 지난 구간은 제외하고 일부 구간은 남은 시간 비율로 조정합니다. 요금은 각 구간의 이용률에 적용합니다.</p>
+      <div class="sim-table-wrap"><table class="sim-table"><thead><tr><th>한국 시각</th><th>A 기대 건수</th><th>B 기대 건수</th><th>A / B 이용률</th></tr></thead><tbody>${plan.intervals.map(b=>`<tr><td>${time(b.startAt)}~${time(b.endAt)}${b.partial?' 일부':''}</td><td>${fmt(b.expected[0],3)}</td><td>${fmt(b.expected[1],3)}</td><td>${fmt(b.utilization[0]*100)} / ${fmt(b.utilization[1]*100)}%</td></tr>`).join('')}</tbody></table></div>
+      <p class="sim-note">초기 상태 수집: ${escape(kst(plan.observedAt))}. kWh는 모델에 없어 화면의 가정값을 유지합니다. 충전시간 통계는 참고만 하며 기본 출력 기반 계산을 유지합니다. 가격·거리·대기 선호도는 가정값입니다.</p>`;
   }
   function checkForecast() {
     invalidate();
     try {
       const p = readForecast();
-      $('sim-forecast-status').textContent = `검증 완료 · ${p.model} · 생성 ${p.generatedAt} · 대상 ${p.targetTime}. 실행 버튼을 눌러 적용하세요.`;
-    } catch (error) { $('sim-forecast-status').textContent = error.message; }
+      showForecast(p);
+    } catch (error) { $('sim-forecast-status').textContent = error.message; $('sim-forecast-summary').innerHTML=''; }
   }
-  $('sim-pricingBasis').addEventListener('change', () => {
-    invalidate(); $('sim-forecast-panel').hidden = $('sim-pricingBasis').value !== 'forecast';
+  function changeBasis() {
+    forecastRequest++; $('sim-forecast-json').value=''; forecastOrigin='';
+    $('sim-forecast-url').value=forecastURLs[$('sim-pricingBasis').value] || forecastURLs.forecast;
+    $('sim-forecast-latest').checked=true;
+    invalidate(); $('sim-forecast-panel').hidden = $('sim-pricingBasis').value === 'observed';
     if (!$('sim-forecast-panel').hidden) checkForecast();
-  });
-  $('sim-forecast-json').addEventListener('input', checkForecast);
+  }
+  $('sim-pricingBasis').addEventListener('change', changeBasis);
+  $('sim-forecast-json').addEventListener('input', ()=>{forecastRequest++;forecastOrigin='붙여넣기 JSON';$('sim-forecast-latest').checked=false;checkForecast();});
+  $('sim-forecast-url').addEventListener('input', ()=>{forecastRequest++;$('sim-forecast-json').value='';checkForecast();});
   $('sim-forecast-file').addEventListener('change', async event => {
     const file = event.target.files[0]; if (!file) return;
-    if (file.size > 2000000) { $('sim-forecast-status').textContent = '2MB 이하 JSON 파일을 선택하세요.'; return; }
+    if (file.size > 10485760) { $('sim-forecast-status').textContent = '10MB 이하 JSON 파일을 선택하세요.'; return; }
+    forecastRequest++; forecastOrigin='업로드 JSON'; $('sim-forecast-latest').checked=false;
     $('sim-forecast-json').value = await file.text(); checkForecast();
   });
-  $('sim-forecast-fetch').addEventListener('click', async () => {
+  async function fetchForecast() {
+    const request=++forecastRequest, basis=$('sim-pricingBasis').value;
     const button = $('sim-forecast-fetch'); button.disabled = true;
     // Clear previous input so a failed fetch cannot silently reuse another forecast.
-    $('sim-forecast-json').value = ''; invalidate();
+    $('sim-forecast-json').value = ''; forecastOrigin=''; invalidate();
     $('sim-forecast-status').textContent = '예측 JSON을 읽는 중입니다…';
     try {
       const url = new URL($('sim-forecast-url').value, location.href);
       if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw new Error('인증정보·쿼리·해시 없는 HTTP(S) JSON URL을 사용하세요.');
-      const response = await fetch(url, { cache: 'no-store', credentials: 'omit', signal: AbortSignal.timeout(15000) });
+      const response = await fetch(url, { cache: 'no-store', credentials: 'omit', signal: AbortSignal.timeout(20000) });
       if (!response.ok) throw new Error(`예측 파일 응답 ${response.status}`);
       const body = await response.text();
-      if (body.length > 2000000) throw new Error('2MB 이하 JSON만 사용할 수 있습니다.');
-      $('sim-forecast-json').value = body; checkForecast();
-    } catch (error) { $('sim-forecast-status').textContent = `${error.message} · 외부 URL은 CORS 허용이 필요합니다.`; }
+      if (body.length > 10485760) throw new Error('10MB 이하 JSON만 사용할 수 있습니다.');
+      if (request!==forecastRequest || basis!==$('sim-pricingBasis').value) throw new Error('불러오는 동안 설정이 변경됐습니다. 다시 읽으세요.');
+      $('sim-forecast-json').value = body;
+      forecastOrigin='URL '+url.href;
+      const prediction=readForecast(); showForecast(prediction); renderEvidence(); return prediction;
+    } catch (error) { $('sim-forecast-status').textContent = error.message; throw error; }
     finally { button.disabled = false; }
+  }
+  $('sim-forecast-fetch').addEventListener('click', async () => {try {await fetchForecast();} catch { /* status already shown */ }});
+  async function preparePrediction() {
+    const basis=$('sim-pricingBasis').value;
+    if (basis==='observed') return null;
+    if ($('sim-forecast-latest').checked) {
+      if (basis==='forecast-v2') {
+        const ids=selected().map(s=>s?.id).join('|');
+        await load({preserveSelection:true}); lock(true);
+        if (ids!==selected().map(s=>s?.id).join('|')) throw new Error('수집 상태가 바뀌어 선택 충전소가 달라졌습니다. A/B를 확인하고 다시 실행하세요.');
+      }
+      await fetchForecast();
+    }
+    const prediction=readForecast(); showForecast(prediction); return prediction;
+  }
+  $('sim-connect').addEventListener('click', async () => {
+    if (busy) return;
+    const preserve=$('sim-mode').value==='real';
+    lock(true);
+    try {
+      $('sim-mode').value='real'; $('sim-pricingBasis').value='forecast-v2'; changeBasis();
+      await load({preserveSelection:preserve}); lock(true);
+      await fetchForecast(); message('AI 수요 모델 연결 완료. 구간별 기대 건수와 가정값을 확인한 뒤 시뮬레이션을 실행하세요.');
+    } catch(error) {message(error.message,true);} finally {lock(false);}
   });
   $('sim-form').addEventListener('change', invalidate);
   for (const id of ['mode', 'region', 'speed']) $('sim-' + id).addEventListener('change', load);
-  for (const id of ['a', 'b', 'distanceMode', 'threshold']) $('sim-' + id).addEventListener('change', cards);
+  for (const id of ['a', 'b', 'distanceMode', 'threshold']) $('sim-' + id).addEventListener('change', ()=>{cards();if ($('sim-pricingBasis').value!=='observed') checkForecast();});
   $('sim-reload').addEventListener('click', load);
   for (const [id, active] of [['tab-monitor', false], ['tab-simulation', true]]) $(id).addEventListener('click', () => {
     $('monitor-view').hidden = active; $('simulation-view').hidden = !active;

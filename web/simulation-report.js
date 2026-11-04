@@ -7,6 +7,8 @@
   const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
   const fmt = (n, d = 2) => Number.isFinite(n) ? n.toLocaleString('ko-KR', { maximumFractionDigits: d, minimumFractionDigits: d }) : '산정 불가';
   const total = values => values.reduce((a, b) => a + b, 0);
+  const pct = value => Number.isFinite(value) ? fmt(value)+'%' : '산정 불가';
+  const kst = value => Number.isFinite(Date.parse(value)) ? new Date(value).toLocaleString('ko-KR',{timeZone:'Asia/Seoul',hourCycle:'h23'})+' (한국 시각)' : String(value ?? '');
   const metrics = [
     ['A 피크 (kW)', r => r.load.stationPeakKw[0]],
     ['B 피크 (kW)', r => r.load.stationPeakKw[1]],
@@ -59,7 +61,15 @@
         ${curves.map((values, p) => `<path d="${values.map((v,b) => `${b ? 'L' : 'M'}${x(b).toFixed(2)},${y(v).toFixed(2)} L${x(b+1).toFixed(2)},${y(v).toFixed(2)}`).join(' ')}" fill="none" stroke="${colors[p]}" stroke-width="2" ${p === 2 ? 'stroke-dasharray="5 3"' : ''}/>`).join('')}
         <text x="48" y="201" font-size="11" fill="#40554a">0분</text><text x="618" y="201" text-anchor="end" font-size="11" fill="#40554a">${n*15}분</text>
       </svg><p class="sim-note">가로축: 시작 후 경과시간(분) · 세로축: ${stride === 1 ? '15분 평균 부하(kW)' : `${stride*15}분 묶음 평균 부하(kW), 원본 15분 값은 CSV`} · 세로 눈금은 자동 범위이며 정격 용량이 아닙니다.</p>
-      <div id="${explanationId}" class="sim-note"><p>${explanations[station]}</p><p>계단은 구간별 평균을 뜻하며, 각 구간은 ${result.options.repeats}회 실행의 평균입니다. 선이 겹치면 정책 결과가 비슷한 것입니다. 표는 반복별 피크의 평균이므로 곡선 최고점과 다를 수 있습니다.</p><p>신규 차량은 시작 후 ${result.options.minutes}분까지만 생성합니다. 이후 대기·충전을 마치며 부하가 0으로 내려갑니다. 표시 종료 시각은 전체 완료 구간을 포함하며 실제 시계 시각이나 이후 수요가 0이라는 예측이 아닙니다.</p></div></figure>`;
+      <div id="${explanationId}" class="sim-note"><p>${explanations[station]}</p><p>계단은 구간별 평균을 뜻하며, 각 구간은 ${result.options.repeats}회 실행의 평균입니다. 선이 겹치면 정책 결과가 비슷한 것입니다. 표는 반복별 피크의 평균이므로 곡선 최고점과 다를 수 있습니다.</p><p>신규 차량은 시작 후 ${fmt(result.options.minutes)}분까지만 생성합니다. 이후 대기·충전을 마치며 부하가 0으로 내려갑니다. 표시 종료 시각은 전체 완료 구간을 포함하며 실제 시계 시각이나 이후 수요가 0이라는 예측이 아닙니다.</p></div></figure>`;
+  }
+  function forecastTable(result) {
+    const p=result.options.forecastPlan;
+    if (!p) return '';
+    const time=t=>new Date(t).toLocaleTimeString('ko-KR',{timeZone:'Asia/Seoul',hour:'2-digit',minute:'2-digit'});
+    return `<h4>v2 기준 수요와 구간별 요금</h4><p class="sim-note">실험 시작 ${esc(kst(p.startAt))} · 초기 상태 수집 ${esc(kst(p.observedAt))} · 충전 시작 건수 추정. 현재 적용할 구간만 사용하며 처음 일부 구간은 남은 시간 비례입니다. 원래 A/B 선택지와 포아송 생성 차량을 모든 정책이 공유하고 재선택합니다. kWh·행동계수는 가정값입니다.</p>
+      <div class="sim-table-wrap"><table class="sim-table"><thead><tr><th>한국 시각</th><th>A 기대 건수</th><th>B 기대 건수</th><th>A / B 이용률 (%)</th>${result.results.map(r=>`<th>${esc(r.label)} A / B 단가</th>`).join('')}</tr></thead><tbody>${p.intervals.map((b,i)=>`<tr><td>${time(b.startAt)}~${time(b.endAt)}${b.partial?' 일부':''}</td><td>${fmt(b.expected[0],3)}</td><td>${fmt(b.expected[1],3)}</td><td>${fmt(b.utilization[0]*100)} / ${fmt(b.utilization[1]*100)}</td>${result.results.map(r=>`<td>${r.priceSchedule[i].prices.map(v=>fmt(v,1)).join(' / ')}</td>`).join('')}</tr>`).join('')}</tbody></table></div>
+      <p class="sim-note">요금은 구간 이용률의 정책 판정으로 정하고 차량은 도착 시 선택 단가를 충전 종료까지 적용합니다. 평균 단가는 시간가중 평균입니다. 제공된 충전시간 평균은 참고용이며 에너지·소요시간에 자동 적용하지 않습니다.</p>`;
   }
   function render(result) {
     if (!valid(result)) return `<h3>충전 부하 집중 변화 리포트</h3><p>${esc(result.results.find(r=>!r.load?.available)?.load?.reason || '부하 집계를 사용할 수 없습니다.')}</p>`;
@@ -68,10 +78,12 @@
     const evidence = result.evidence || [];
     return `<h3>충전 부하 집중 변화 리포트</h3>
       <p class="sim-note">가정 기반 시뮬레이션 · 15분 평균 등가 충전 부하 · 실제 배전망 측정 결과 아님</p>
-      <p>${esc(c.source)} · ${esc(c.region)}<br>실행 시각: ${esc(c.executedAt || '기록 없음')}<br>요금 근거: ${esc(c.pricingBasis)} ${esc(c.forecastInfo)}<br>A: ${esc(result.stations[0].name)} (${esc(result.stations[0].id)}) / B: ${esc(result.stations[1].name)} (${esc(result.stations[1].id)})<br>신규 ${o.drivers}명 · 도착 ${o.minutes}분 · 차량당 ${o.energy}kWh · ${o.repeats}회 · 시드 ${o.seed}</p>
+      <p>${esc(c.source)} · ${esc(c.region)}<br>실행 시각: ${esc(kst(c.executedAt || '기록 없음'))}<br>요금 근거: ${esc(c.pricingBasis)} ${esc(c.forecastInfo)}<br>A: ${esc(result.stations[0].name)} (${esc(result.stations[0].id)}) / B: ${esc(result.stations[1].name)} (${esc(result.stations[1].id)})<br>신규 ${fmt(o.drivers,3)}명${o.forecastPlan?' (기대값)':''} · 도착 ${fmt(o.minutes)}분 · 차량당 ${o.energy}kWh · ${o.repeats}회 · 시드 ${o.seed}</p>
+      ${o.forecastPlan ? `<p class="sim-status">생성 평균 ${fmt(result.population.mean,3)}명 · 범위 ${result.population.min}~${result.population.max}명 · 신규 0명 반복 ${result.population.emptyRuns}/${o.repeats}회. 대기시간·비용·거리는 전체 생성 차량을 기준으로 집계합니다. 모든 반복이 0명이라면 선택·대기·비용의 0은 효과 측정값을 의미하지 않습니다.</p>` : ''}
+      ${forecastTable(result)}
       ${overRated ? '<p class="sim-status" data-error="true">충전량과 가정 충전시간으로 계산한 등가 전력이 대표 출력을 넘는 차량이 있습니다. 현재 결과는 에너지 보존 시나리오이며 물리적으로 가능한 부하로 해석할 수 없습니다. 신규 차량 충전시간을 ‘충전량 ÷ 대표 출력’으로 바꾸어 다시 실행하세요.</p>' : '<p class="sim-note">신규 차량은 충전량÷소요시간의 일정 전력, 초기 차량은 대표 출력×가정 잔여시간으로 계산합니다. 실제 충전곡선·효율·출력 공유·비충전 부하는 제외합니다.</p>'}
       <div class="sim-table-wrap"><table class="sim-table"><caption>각 반복에서 지표를 계산한 뒤 평균 · 피크 저감률은 양수=감소, 음수=증가</caption><thead><tr><th>지표</th>${results.map(r=>`<th>${esc(r.label)}</th>`).join('')}</tr></thead><tbody>${metrics.map(([label,get])=>`<tr><th scope="row">${label}</th>${results.map(r=>`<td>${fmt(get(r))}</td>`).join('')}</tr>`).join('')}</tbody></table></div>
-      <div class="sim-report-findings">${results.slice(1).map(r=>`<p><strong>${esc(r.label)}</strong>: 고정요금 대비 A 피크 저감률 ${fmt(r.load.stationPeakReductionPct[0])}%, B ${fmt(r.load.stationPeakReductionPct[1])}%, 합산 ${fmt(r.load.combinedPeakReductionPct)}%. 합산 피크 차이는 ${fmt(r.load.combinedPeakDeltaKw)}kW이고, 평균 대기 차이는 ${fmt(r.wait-results[0].wait)}분입니다.</p>`).join('')}</div>
+      <div class="sim-report-findings">${results.slice(1).map(r=>`<p><strong>${esc(r.label)}</strong>: 고정요금 대비 A 피크 저감률 ${pct(r.load.stationPeakReductionPct[0])}, B ${pct(r.load.stationPeakReductionPct[1])}, 합산 ${pct(r.load.combinedPeakReductionPct)}. 합산 피크 차이는 ${fmt(r.load.combinedPeakDeltaKw)}kW이고, 평균 대기 차이는 ${fmt(r.wait-results[0].wait)}분입니다.</p>`).join('')}</div>
       <p class="sim-note">A의 피크가 줄어도 B 또는 합산 피크는 증가할 수 있습니다. 합산 피크는 같은 시각의 A+B 곡선에서 계산하며 A 피크+B 피크를 더하지 않습니다. SE는 반복 난수에 따른 표준오차이며 모델·행동 가정·미래 예측의 불확실성을 포함하지 않습니다.</p>
       ${[0,1,2].map(i=>chart(result,i)).join('')}
       <p class="sim-note">곡선은 반복 평균입니다. 표는 반복별 최대값의 평균이므로 곡선의 최대값과 다를 수 있습니다. 모든 정책의 신규 충전 필요량과 초기 상태는 같습니다. 도착 종료 후에도 모든 차량이 완료될 때까지 계산하며, 부하율 차이는 동일한 도착 생성 기간에서 충전소별 처리 가능 대표 용량으로 나눈 평균 부하율의 절댓값 차이입니다. 이것만으로 변압기·배전선로 피크 저감을 입증하지 않습니다.</p>
@@ -86,11 +98,17 @@
     if (!valid(result)) return [];
     const n = Math.max(...result.results.map(r=>r.load.series.length));
     const output = [['분석 구분','가정 기반 15분 평균 등가 충전 부하. 실제 배전망 측정 아님'],
-      ...Object.entries(result.context || {}), ...Object.entries(result.options),
+      ...Object.entries(result.context || {}), ...Object.entries(result.options).map(([k,v])=>[k,v!==null && typeof v==='object'?JSON.stringify(v):v]),
+      ...Object.entries(result.population || {}).map(([k,v])=>['생성인원_'+k,v]),
       ...result.stations.flatMap((s,i)=>Object.entries(s).map(([k,v])=>[`${i?'B':'A'}_${k}`,v])), [],
       ['입력 근거','값','구분','근거와 한계'],...(result.evidence || []).map(r=>[r.item,r.value,r.kind,r.basis]),[],
-      ['지표',...result.results.map(r=>r.label)],...metrics.map(([label,get])=>[label,...result.results.map(get)]),[],
-      ['정책','구간시작_분','구간종료_분','A평균부하_kW','B평균부하_kW','합산평균부하_kW']];
+      ['지표',...result.results.map(r=>r.label)],...metrics.map(([label,get])=>[label,...result.results.map(get)])];
+    if (result.options.forecastPlan) {
+      output.push([],['v2 구간 수요·요금. 원래 충전소별 시작 건수 추정'],['시작_ISO','종료_ISO','A기대건수','B기대건수','A이용률','B이용률','정책','A단가','B단가']);
+      for (const [i,bin] of result.options.forecastPlan.intervals.entries()) for (const r of result.results)
+        output.push([bin.startAt,bin.endAt,...bin.expected,...bin.utilization,r.label,...r.priceSchedule[i].prices]);
+    }
+    output.push([],['정책','구간시작_분','구간종료_분','A평균부하_kW','B평균부하_kW','합산평균부하_kW']);
     for (const r of result.results) for (let b=0;b<n;b++) {
       const kw = r.load.series[b] || [0,0]; output.push([r.label,b*15,(b+1)*15,...kw,total(kw)]);
     }

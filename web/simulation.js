@@ -45,6 +45,62 @@
     }
     return { utilizationById, model: payload.model_name, generatedAt: payload.generated_at, targetTime: payload.target_time };
   }
+  function forecastV2(payload, stations, { now = Date.now(), observedAt } = {}) {
+    if (payload?.example_only) throw new Error('형식 설명용 예시는 실제 모델 예측으로 실행할 수 없습니다.');
+    if (!payload || payload.schema_version !== 2 || typeof payload.model_name !== 'string' || !payload.model_name.trim() || !Array.isArray(payload.predictions) || payload.predictions.length > 100000)
+      throw new Error('v2 모델명·predictions 배열을 확인하세요.');
+    if (payload.interval_minutes !== 15 || payload.baseline !== 'existing_prices_without_new_policy' || payload.demand_measure !== 'charging_starts')
+      throw new Error('15분 구간·기존 요금 기준·charging_starts 수요 정의가 필요합니다.');
+    const timestamp = value => typeof value === 'string' && /(Z|[+-]\d\d:\d\d)$/.test(value) ? Date.parse(value) : NaN;
+    const generated = timestamp(payload.generated_at), start = timestamp(payload.simulation_start_at);
+    if (!Number.isFinite(generated) || !Number.isFinite(start) || generated > now + 300000 || now - generated > 5400000 || start < generated || start > now + 300000)
+      throw new Error('v2 생성·시작 시각이 잘못됐거나 생성 후 90분을 넘었습니다. 최신 예측을 불러오세요.');
+    if (!Number.isFinite(observedAt) || observedAt > now + 300000 || now - observedAt > 2700000)
+      throw new Error('v2 연동에는 45분 이내에 수집한 초기 상태가 필요합니다. 실제 데이터를 새로 읽으세요.');
+    const selectedKeys = stations.map(s => s.id + ':' + s.speed), rows = selectedKeys.map(() => new Map());
+    for (const row of payload.predictions) {
+      const index = selectedKeys.indexOf(row.station_id + ':' + row.speed);
+      if (index < 0) continue;
+      const a = timestamp(row.interval_start), b = timestamp(row.interval_end);
+      if (!Number.isFinite(a) || !Number.isFinite(b) || b - a !== 900000 || a < start || (a-start)%900000 !== 0 ||
+          !Number.isFinite(row.utilization_mean) || row.utilization_mean < 0 || row.utilization_mean > 1 ||
+          !Number.isFinite(row.expected_new_sessions) || row.expected_new_sessions < 0)
+        throw new Error('선택 충전소의 v2 시간 구간·이용률·기대 건수를 확인하세요.');
+      if (rows[index].has(a)) throw new Error('선택 충전소에 중복된 v2 시간 구간이 있습니다.');
+      rows[index].set(a, { ...row, a, b });
+    }
+    if (rows.some(r=>!r.size)) throw new Error('선택한 A/B의 같은 종류 v2 예측이 모두 필요합니다.');
+    const times = [...rows[0].keys()].sort((a,b)=>a-b);
+    if (times.length > 96 || rows[1].size !== times.length || times[0] !== start || times.some((t,i)=>!rows[1].has(t) || (i && t-times[i-1] !== 900000)))
+      throw new Error('A/B 예측은 시작부터 같은 연속 15분 구간을 빠짐없이 포함해야 합니다.');
+    const simulationStart = Math.max(now, start), end = times[times.length-1] + 900000;
+    if (end - simulationStart < 60000) throw new Error('남은 v2 예측 기간이 1분 미만입니다. 최신 예측을 불러오세요.');
+    const intervals = times.filter(t=>t+900000>simulationStart).map(t=> {
+      const a = Math.max(t,simulationStart), b = t+900000, fraction = (b-a)/900000;
+      return { start: (a-simulationStart)/60000, end: (b-simulationStart)/60000,
+        startAt: new Date(a).toISOString(), endAt: new Date(b).toISOString(),
+        utilization: rows.map(r=>r.get(t).utilization_mean),
+        expected: rows.map(r=>r.get(t).expected_new_sessions*fraction), partial: fraction < 1 };
+    });
+    const minutes = (end-simulationStart)/60000, expectedByOrigin = [0,0];
+    for (const bin of intervals) for (let i=0;i<2;i++) expectedByOrigin[i] += bin.expected[i];
+    const expectedDrivers = expectedByOrigin[0]+expectedByOrigin[1];
+    if (expectedDrivers > 500) throw new Error('예측 수요가 500건을 넘습니다. 더 작은 충전소 쌍으로 비교하세요.');
+    const utilizationById = Object.create(null);
+    stations.forEach((s,i)=>{utilizationById[s.id]=intervals.reduce((n,b)=>n+b.utilization[i]*(b.end-b.start),0)/minutes;});
+    const stationStats = stations.map(s=>(payload.stations || []).find(r=>r.station_id===s.id && r.speed===s.speed) || null);
+    return { model: payload.model_name, generatedAt: payload.generated_at, targetTime: new Date(end).toISOString(), utilizationById,
+      plan: { stationKeys: selectedKeys, generatedAt: payload.generated_at, startAt: new Date(simulationStart).toISOString(), endAt: new Date(end).toISOString(),
+        observedAt: new Date(observedAt).toISOString(), minutes, expectedDrivers, expectedByOrigin, intervals,
+        demandMeasure: payload.demand_measure, method: payload.method || {}, stationStats,
+        durationStats: payload.duration_minutes?.[stations[0].speed] || null, validation: payload.validation?.[stations[0].speed] || null } };
+  }
+  function poisson(mean, random) {
+    if (mean === 0) return 0;
+    const limit = Math.exp(-mean); let count = 0, product = 1;
+    do { count++; product *= random(); } while (product > limit);
+    return count - 1;
+  }
   // Optional utilizationById contains externally supplied future utilization [0,1]. Never generated here.
   function price(s, policy, o, utilizationById) {
     let state = status(s, o.threshold);
@@ -67,6 +123,22 @@
     const ranges = { drivers: [1, 500, true], minutes: [1, 1440], energy: [.1, 200], discount: [0, 1], surcharge: [0, 1],
       alpha: [0, 100000], beta: [0, 100000], tau: [1, 100000], sensitivity: [0, 10], repeats: [1, 500, true],
       seed: [0, 4294967295, true], distance: [0, 200], threshold: [.1, .9] };
+    if (o.forecastPlan) {
+      ranges.drivers = [0,500,false]; ranges.minutes = [1,1440,false];
+      const plan = o.forecastPlan;
+      if (!Array.isArray(plan.intervals) || !plan.intervals.length || plan.intervals.length > 96 ||
+          plan.stationKeys?.join('|') !== stations.map(s=>s.id+':'+s.speed).join('|') ||
+          Math.abs(plan.expectedDrivers-o.drivers)>1e-8 || Math.abs(plan.minutes-o.minutes)>1e-8)
+        throw new Error('선택 충전소와 예측 수요 계획을 다시 확인하세요.');
+      let expected = 0, end = 0;
+      for (const bin of plan.intervals) {
+        if (!Number.isFinite(bin.start) || !Number.isFinite(bin.end) || Math.abs(bin.start-end)>1e-8 || bin.end<=bin.start || bin.end-bin.start>15.000001 ||
+            !Array.isArray(bin.expected) || bin.expected.length!==2 || bin.expected.some(v=>!Number.isFinite(v)||v<0) ||
+            !Array.isArray(bin.utilization) || bin.utilization.length!==2 || bin.utilization.some(v=>!Number.isFinite(v)||v<0||v>1)) throw new Error('잘못된 예측 수요 구간입니다.');
+        expected += bin.expected[0]+bin.expected[1]; end = bin.end;
+      }
+      if (Math.abs(expected-o.drivers)>1e-8 || Math.abs(end-o.minutes)>1e-8) throw new Error('예측 건수·기간 합계가 일치하지 않습니다.');
+    }
     for (const [key, [lo, hi, integer]] of Object.entries(ranges)) {
       if (!Number.isFinite(o[key]) || o[key] < lo || o[key] > hi || (integer && !Number.isInteger(o[key])))
         throw new Error(`${key}: ${lo}~${hi}${integer ? ' 정수' : ''} 값을 입력하세요.`);
@@ -84,6 +156,16 @@
   function population(stations, o, random) {
     // Fixed random consumption, independent of policy and choices.
     const initial = stations.map(s => Array.from({ length: s.charging }, () => random()));
+    if (o.forecastPlan) {
+      const drivers = [];
+      for (const bin of o.forecastPlan.intervals) for (let origin=0;origin<2;origin++) {
+        const count = poisson(bin.expected[origin],random);
+        if (drivers.length+count>2000) throw new Error('이번 반복의 생성 차량이 2,000명을 넘었습니다. 분석 규모를 줄이세요.');
+        for (let n=0;n<count;n++) drivers.push({id:drivers.length,origin,arrival:bin.start+random()*(bin.end-bin.start),duration:20+random()*20,choice:random()});
+      }
+      drivers.sort((a,b)=>a.arrival-b.arrival||a.id-b.id);
+      return { initial, drivers };
+    }
     const drivers = Array.from({ length: o.drivers }, (_, id) => ({ id, arrival: random() * o.minutes, duration: 20 + random() * 20, choice: random() }))
       .sort((a, b) => a.arrival - b.arrival || a.id - b.id);
     return { initial, drivers };
@@ -146,7 +228,11 @@
       overRatedSessions, lastCompletionMinutes };
   }
   function runPolicy(stations, o, people, policy, utilizationById) {
-    const prices = stations.map(s => price(s, policy, o, utilizationById));
+    const priceSchedule = o.forecastPlan?.intervals.map(bin=> {
+      const u = Object.fromEntries(stations.map((s,i)=>[s.id,bin.utilization[i]]));
+      return {start:bin.start,end:bin.end,prices:stations.map(s=>price(s,policy,o,u))};
+    });
+    const prices = priceSchedule ? stations.map((s,i)=>priceSchedule.reduce((n,b)=>n+b.prices[i]*(b.end-b.start),0)/o.minutes) : stations.map(s => price(s, policy, o, utilizationById));
     const queues = stations.map((s, i) => [
       ...Array(s.avail).fill(0), ...people.initial[i].map(u => u * duration(s, o, 30))
     ]);
@@ -154,36 +240,43 @@
     const records = [], count = [0, 0];
     let wait = 0, estimated = 0, charge = 0, distance = 0, discount = 0, completion = 0;
     for (const d of people.drivers) {
+      const quote = priceSchedule ? priceSchedule.find(b=>d.arrival>=b.start && d.arrival<b.end)?.prices : prices;
+      if (!quote) throw new Error('도착 시각에 대응하는 예측 요금 구간이 없습니다.');
+      const origin = d.origin ?? 0;
       const next = queues.map(q => q.length ? Math.min(...q) : Infinity);
       const expected = next.map(t => Math.max(0, t - d.arrival));
-      const costs = stations.map((s, i) => o.sensitivity * o.energy * prices[i] + o.alpha * (i ? o.distance : 0) + o.beta * expected[i]);
+      const costs = stations.map((s, i) => o.sensitivity * o.energy * quote[i] + o.alpha * (i !== origin ? o.distance : 0) + o.beta * expected[i]);
       // An unusable station must stay excluded even if beta=0 (0 * Infinity = NaN).
       const probs = probability(costs.map((c, i) => queues[i].length ? c : Infinity), o.tau);
       const i = d.choice < probs[0] ? 0 : 1, q = queues[i], slot = q.indexOf(next[i]);
       const start = Math.max(d.arrival, next[i]), actual = start - d.arrival;
       const end = start + duration(stations[i], o, d.duration);
       q[slot] = end; count[i]++; wait += actual; estimated += expected[i];
-      charge += o.energy * prices[i]; distance += i ? o.distance : 0;
-      discount += o.energy * Math.max(0, stations[i].base - prices[i]); completion = Math.max(completion, end);
-      records.push({ driver: d.id, station: i, arrival: d.arrival, expectedWait: expected[i], actualWait: actual, start, end });
+      charge += o.energy * quote[i]; distance += i !== origin ? o.distance : 0;
+      discount += o.energy * Math.max(0, stations[i].base - quote[i]); completion = Math.max(completion, end);
+      records.push({ driver: d.id, origin, station: i, price:quote[i], arrival: d.arrival, expectedWait: expected[i], actualWait: actual, start, end });
     }
-    return { policy, prices, count, share: count.map(n => n / o.drivers), wait: wait / o.drivers,
-      expectedWait: estimated / o.drivers, fee: charge / o.drivers, distance: distance / o.drivers,
+    const n = people.drivers.length, denominator = n || 1;
+    return { policy, prices, priceSchedule, drivers:n, count, share: count.map(v => v / denominator), wait: wait / denominator,
+      expectedWait: estimated / denominator, fee: charge / denominator, distance: distance / denominator,
       discount, revenue: charge, completion, records, load: loadProfile(stations, o, initial, records) };
   }
   async function compare(stations, options = {}, onProgress = () => {}, utilizationById, control = {}) {
     const o = { ...defaults, ...options }; validate(stations, o);
     const random = rng(o.seed), results = policies.map((label, policy) => ({ label, policy, count: [0, 0], share: [0, 0], wait: 0, expectedWait: 0, fee: 0, distance: 0, discount: 0, revenue: 0, completion: 0, samples: [] }));
+    const populationCounts = [];
     const peakSamples = policies.map(() => []), peakDeltaSamples = policies.map(() => []);
     for (let r = 0; r < o.repeats; r++) {
       if (control.cancelled?.()) throw new Error('분석을 중단했습니다.');
       const people = control.populations ? control.populations[r] : population(stations, o, random);
+      populationCounts.push(people.drivers.length);
       let referencePeak = null;
       for (let p = 0; p < 3; p++) {
         const run = runPolicy(stations, o, people, p, utilizationById), out = results[p];
-        for (const key of ['wait', 'expectedWait', 'fee', 'distance', 'discount', 'revenue', 'completion']) out[key] += run[key] / o.repeats;
+        for (const key of ['wait', 'expectedWait', 'fee', 'distance']) out[key] += run[key] * run.drivers;
+        for (const key of ['discount', 'revenue', 'completion']) out[key] += run[key] / o.repeats;
         for (let i = 0; i < 2; i++) { out.count[i] += run.count[i] / o.repeats; out.share[i] += run.share[i] / o.repeats; }
-        out.samples.push(run.wait); out.prices = run.prices;
+        out.samples.push({n:run.drivers,wait:run.wait}); out.prices = run.prices; out.priceSchedule = run.priceSchedule;
         const l = run.load;
         if (!l.available) out.load = l;
         else if (out.load?.available !== false) {
@@ -210,11 +303,13 @@
       }
       if (r % 10 === 0) { onProgress((r + 1) / o.repeats); await new Promise(resolve => setTimeout(resolve, 0)); }
     }
+    const totalDrivers = populationCounts.reduce((a,b)=>a+b,0), meanDrivers = totalDrivers/o.repeats;
     for (const out of results) {
+      for (const key of ['wait','expectedWait','fee','distance']) out[key] /= totalDrivers || 1;
+      out.share = out.count.map(n=>meanDrivers ? n/meanDrivers : 0);
       out.waitChange = results[0].wait > 1e-9 ? (out.wait / results[0].wait - 1) * 100 : null;
       out.revenueChange = out.revenue - results[0].revenue;
-      const variance = o.repeats > 1 ? out.samples.reduce((s, x) => s + (x - out.wait) ** 2, 0) / (o.repeats - 1) : 0;
-      out.waitSE = o.repeats > 1 ? Math.sqrt(variance / o.repeats) : null;
+      out.waitSE = o.repeats > 1 && meanDrivers > 0 ? Math.sqrt(out.samples.reduce((s,x)=>s+(x.n*(x.wait-out.wait))**2,0)/((o.repeats-1)*o.repeats*meanDrivers**2)) : null;
       delete out.samples;
     }
     const se = values => {
@@ -229,15 +324,17 @@
       out.load.stationPeakReductionPct = out.load.stationPeakKw.map((p, i) => baseline.stationPeakKw[i] > 1e-9 ? (baseline.stationPeakKw[i] - p) / baseline.stationPeakKw[i] * 100 : null);
       out.load.peakSE = se(peakSamples[out.policy]); out.load.peakDeltaSE = se(peakDeltaSamples[out.policy]);
     }
-    onProgress(1); return { options: o, stations: stations.map(s => ({ ...s })), results };
+    onProgress(1); return { options: o, stations: stations.map(s => ({ ...s })), results,
+      population: {expected:o.drivers,mean:meanDrivers,min:Math.min(...populationCounts),max:Math.max(...populationCounts),emptyRuns:populationCounts.filter(n=>!n).length} };
   }
   const sweepKeys = ['drivers', 'minutes', 'energy', 'sensitivity', 'alpha', 'beta', 'tau', 'distance', 'discount', 'surcharge', 'threshold', 'durationMode'];
   async function sweep(stations, options, key, values, onProgress = () => {}, utilizationById, cancelled = () => false) {
     const base = { ...defaults, ...options }; validate(stations, base);
+    if (base.forecastPlan && ['drivers','minutes'].includes(key)) throw new Error('v2의 인원·기간은 예측에서 정합니다. 다른 가정값을 비교하거나 수동 모드로 바꾸세요.');
     if (!sweepKeys.includes(key) || !Array.isArray(values) || !values.length || values.length > 8) throw new Error('비교 항목과 1~8개 수준을 확인하세요.');
     const levels = [...new Set([base[key], ...values])].sort((a, b) => typeof a === 'number' ? a - b : String(a).localeCompare(String(b)));
     for (const value of levels) validate(stations, { ...base, [key]: value });
-    const maxDrivers = key === 'drivers' ? Math.max(...levels) : base.drivers;
+    const maxDrivers = base.forecastPlan ? Math.min(2000,Math.ceil(base.drivers+8*Math.sqrt(base.drivers)+10)) : key === 'drivers' ? Math.max(...levels) : base.drivers;
     if (levels.length * base.repeats * maxDrivers * 3 > 2000000) throw new Error('분석량이 큽니다. 비교 수준·운전자 수·반복 횟수를 줄여 주세요 (최대 200만 차량·정책 계산).');
     // Reuse the exact baseline populations, including initial residuals. Extra drivers
     // have a separate stream so increasing N never changes the baseline random draws.
@@ -245,14 +342,14 @@
     for (let r = 0; r < base.repeats; r++) {
       const people = population(stations, base, random), extraRandom = rng((base.seed ^ Math.imul(r + 1, 0x9e3779b1)) >>> 0);
       const drivers = people.drivers.map(d => ({ ...d }));
-      for (let id = base.drivers; id < maxDrivers; id++) drivers.push({ id, arrival: extraRandom() * base.minutes, duration: 20 + extraRandom() * 20, choice: extraRandom() });
+      if (!base.forecastPlan) for (let id = base.drivers; id < maxDrivers; id++) drivers.push({ id, arrival: extraRandom() * base.minutes, duration: 20 + extraRandom() * 20, choice: extraRandom() });
       bank.push({ initial: people.initial, drivers });
     }
     const scenarios = [];
     for (let i = 0; i < levels.length; i++) {
       if (cancelled()) throw new Error('분석을 중단했습니다.');
       const value = levels[i], o = { ...base, [key]: value };
-      const populations = bank.map(p => ({ initial: p.initial, drivers: p.drivers.filter(d => d.id < o.drivers)
+      const populations = bank.map(p => ({ initial: p.initial, drivers: p.drivers.filter(d => base.forecastPlan || d.id < o.drivers)
         .map(d => ({ ...d, arrival: o.minutes === base.minutes ? d.arrival : d.arrival / base.minutes * o.minutes })).sort((a, b) => a.arrival - b.arrival || a.id - b.id) }));
       const output = await compare(stations, o, p => onProgress((i + p) / levels.length), utilizationById, { populations, cancelled });
       scenarios.push({ value, ...output });
@@ -275,19 +372,29 @@
       add(`${prefix} 기본 단가`, `${s.base}원/kWh`, !real ? '가정값' : s.source === '운영사' ? '공시값' : '추정값', `${s.source || '운영사 요금표'} · ${s.upd || '요금표 시각 미제공'} · 실제 청구액 아님`);
       add(`${prefix} 대표 출력`, `${s.kw}kW`, real ? '추정값' : '가정값', '기존 관제 대표 출력 사용. 원자료 출력 또는 기본 대체값이며 개별 충전기의 실효 출력과 다를 수 있음');
     }
-    for (const [key, label, unit] of [['drivers','신규 운전자','명'],['minutes','도착 생성 기간','분'],['energy','차량당 충전량','kWh'],['sensitivity','가격 민감도','배'],['alpha','이동 비용 α','원/km'],['beta','대기 비용 β','원/분'],['tau','선택 다양성 τ','원']])
-      add(label, `${o[key]}${unit}`, '가정값', '요구사항 예시를 초기값으로 사용. 변경값은 사용자 시나리오이며 실측·통계 보정 전');
+    for (const [key, label, unit] of [['drivers','신규 운전자','명'],['minutes','도착 생성 기간','분'],['energy','차량당 충전량','kWh'],['sensitivity','가격 민감도','배'],['alpha','이동 비용 α','원/km'],['beta','대기 비용 β','원/분'],['tau','선택 다양성 τ','원']]) {
+      const derived = o.forecastPlan && ['drivers','minutes'].includes(key);
+      add(label, `${o[key]}${unit}`, derived ? '추정값' : '가정값', derived ? 'v2 남은 구간의 충전 시작 건수 추정. 실제 도착·대기·포기 차량을 관측한 값 아님' : key==='energy' ? '공공 API에 kWh 없음. 사용자 가정값이며 예측 건수·충전시간으로 역산하지 않음' : '요구사항 예시를 초기값으로 사용. 변경값은 사용자 시나리오이며 실측·통계 보정 전');
+    }
     for (const [key, label] of [['discount','여유 할인율'],['surcharge','혼잡 할증율'],['threshold','여유 판정 대기율']])
       add(label, `${o[key] * 100}%`, '정책 설정', '기존 프로젝트 기본 정책에서 시작. 정책 효과를 검증한 최적값이 아님');
-    add('B 추가 거리', `${o.distance}km`, context.distanceMode === 'coords' ? '추정값' : '가정값', context.distanceMode === 'coords' ? 'A/B 좌표의 직선거리. 도로 거리·이동시간 아님' : '사용자 지정 추가 거리. A는 0km 가정');
+    add(o.forecastPlan ? '대체 충전소 추가 거리' : 'B 추가 거리', `${o.distance}km`, context.distanceMode === 'coords' ? '추정값' : '가정값', (context.distanceMode === 'coords' ? 'A/B 좌표의 직선거리. 도로 거리·이동시간 아님' : '사용자 지정 추가 거리.') + (o.forecastPlan ? ' 원래 A/B 선택지에서는 0km, 다른 곳으로 바꾸면 추가 거리 적용' : ' A는 0km 가정'));
     add('신규 충전시간', o.durationMode === 'power' ? '충전량 ÷ 대표 출력 × 60분' : '20~40분 균등분포', '가정값', '간소화 모델. 충전효율·충전곡선·출력 공유 제외');
     add('초기 잔여 충전시간', o.durationMode === 'power' ? '0~(충전량 ÷ 대표 출력 × 60)분 균등분포' : '0~30분 균등분포', '가정값', '초기 차량의 실제 잔여시간은 관측하지 않음');
-    add('도착·선택 모형', '기간 내 균등 도착 · 로짓 선택', '가정값', '취소·포기·추가 이동시간 제외. 행동모델 실측 보정 전');
+    add('도착·선택 모형', o.forecastPlan ? '구간·원래 선택지별 포아송 건수 + 구간 내 균등 도착 · 로짓 재선택' : '기간 내 균등 도착 · 로짓 선택', '가정값', '취소·포기·추가 이동시간 제외. 행동모델 실측 보정 전');
     add('반복·난수', `${o.repeats}회 · 시드 ${o.seed}`, '실험 설정', '재현성과 반복 변동 확인용. 반복 횟수는 실세계 정확도를 보장하지 않음');
     add('요금 판정 근거', context.pricingBasis || '현재 수집 상태', context.forecastInfo ? '추정값' : context.forecastRequested ? '미입력' : real ? '실측·수집값' : '가정값', context.forecastInfo ? `${context.forecastInfo} · 외부 예측. 정확도·학습자료는 이 사이트에서 검증하지 않음` : context.forecastRequested ? '예측 JSON이 없거나 아직 검증되지 않았습니다. 실행 시 검증합니다.' : '시작 시 상태에 정책을 적용하고 단가 고정');
     if (context.forecastInfo) for (const [key, label] of [['forecastUtilizationA','A 예측 이용률'], ['forecastUtilizationB','B 예측 이용률']])
-      add(label, `${context[key] * 100}%`, '추정값', context.forecastInfo);
+      add(label, `${context[key] * 100}%`, '추정값', context.forecastInfo + (o.forecastPlan ? ' · 남은 구간 시간가중 평균. 요금은 각 구간의 이용률로 결정' : ''));
+    if (context.forecastInput) add('예측 입력 출처',context.forecastInput,'추정값','모델 결과의 입력 경로. 모델 정확도나 데이터 품질을 인증하지 않음');
+    if (o.forecastPlan) {
+      const p=o.forecastPlan;
+      add('실험 시작·초기 상태 시각', `${p.startAt} / 수집 ${p.observedAt}`, '실험 설정', '실행 시점부터 남은 구간만 사용. 과거 구간 제외, 일부 구간의 건수는 남은 시간 비율로 조정. 수집 후 상태는 유지한다고 가정');
+      add('v2 건수 방법', JSON.stringify(p.method), '추정값', '모델 제공 방법 설명. 이용률·충전시간 기반 시작 건수 추정이며 가격 반응을 학습한 모델은 아님');
+      add('v2 시작 건수 검증', JSON.stringify(p.validation), '추정값', '제공 모델의 검증 참고. 초기 세션 기록에 따른 제한이 있으며 실측 도착 수 검증이 아님');
+      (p.stationStats || []).forEach((s,i)=>{if(s) add(`${i?'B':'A'} 충전시간 통계 참고`, `${s.mean_duration_minutes}분 · ${s.duration_level}`, '추정값', '모델 제공 충북 세션 통계/지역 대체 평균. kWh를 알 수 없어 충전시간·에너지에 자동 적용하지 않음');});
+    }
     return rows;
   }
-  return { defaults, policies, demo, rng, status, price, probability, validate, population, runPolicy, loadProfile, compare, forecast, sweep, sweepKeys, evidence };
+  return { defaults, policies, demo, rng, status, price, probability, validate, population, runPolicy, loadProfile, compare, forecast, forecastV2, poisson, sweep, sweepKeys, evidence };
 });
