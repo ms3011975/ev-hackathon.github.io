@@ -1,0 +1,48 @@
+{
+  "schemaVersion": 1,
+  "sourceTitle": "제주특별자치도_전체 전기차자동차 충전 이력 데이터(파일)_20221130",
+  "sourceUrl": "https://www.data.go.kr/data/15109706/fileData.do",
+  "sourceFileSha256": "8e3cf6c904b229ff7167bfef3a527e30c7e7084efebb2b2259621a675d4c7e8a",
+  "sourceEncoding": "CP949",
+  "method": "중복 제거 후 양수 충전량의 합계 ÷ 해당 충전 건수. 버스 전용·타입 미상·0 이하/결측 제외. 소수 둘째 자리 반올림.",
+  "unitNote": "CSV 단위 미기재. 제주 공시 250원/kWh와 원본 충전금액·충전량을 대조해 kWh로 해석한 추정값.",
+  "unitReferenceUrl": "https://www.epeople.go.kr/api/thk/conversational/selectConversationalDetail.npaid?ideaRegNo=1AE-2007-0001036",
+  "unitCrossCheck": {
+    "billedSessionsJanJun2021": 202747,
+    "withinOneWonOf250PerKwh": 198756
+  },
+  "limitation": "2021~2022년 제주 자료를 충북에 이전 적용한 추정값. 현재 충북 실측값·차종별 대표값 아님. 양수 충전 건의 조건부 평균이며 0kWh 시도·취소를 제외. 개별 분포·시간대 차이 미반영.",
+  "rawRows": 1251255,
+  "excluded": {
+    "bus_charger": 135309,
+    "non_positive_energy": 21227,
+    "unknown_type": 57,
+    "exact_duplicate": 10
+  },
+  "includedTypes": {
+    "AC급속3상": 124687,
+    "DC차데모": 108982,
+    "DC차데모+AC3상": 1560,
+    "DC차데모+AC3상+DC콤보": 246499,
+    "DC콤보": 481268,
+    "완속": 131656
+  },
+  "bySpeed": {
+    "fast": {
+      "defaultKwh": 14.82,
+      "meanKwh": 14.81538494448575,
+      "totalKwh": 14267156.44,
+      "sessions": 962996,
+      "start": "2021-01-01",
+      "end": "2022-06-30"
+    },
+    "slow": {
+      "defaultKwh": 16.24,
+      "meanKwh": 16.238702983532843,
+      "totalKwh": 2137922.68,
+      "sessions": 131656,
+      "start": "2021-01-01",
+      "end": "2022-06-23"
+    }
+  }
+}

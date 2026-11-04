@@ -5,6 +5,25 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const report = require('../web/simulation-report.js');
 
+test('Jeju defaults follow speed and manual/sweep overrides retain honest provenance', async () => {
+  assert.equal(sim.defaults.energy,14.82);
+  const stations=sim.demo().map(s=>({...s,speed:'slow',kw:7}));
+  const output=await sim.compare(stations,{drivers:2,repeats:1});
+  assert.equal(output.options.energy,16.24);
+  assert.ok(Math.abs(output.results[0].load.newEnergyKwh-32.48)<1e-8);
+  const context={speed:'slow',energySource:'jeju'};
+  const row=o=>sim.evidence(stations,o,context).find(r=>r.item==='차량당 충전량');
+  assert.equal(row(output.options).kind,'추정값');
+  assert.match(row(output.options).basis,/131656건/);
+  assert.match(row(output.options).basis,/단위 미기재/);
+  assert.match(row(output.options).basis,/15109706/);
+  assert.equal(row({...output.options,energy:30}).kind,'가정값');
+  assert.equal(sim.evidence(stations,output.options,{...context,energySource:'manual'}).find(r=>r.item==='차량당 충전량').kind,'가정값');
+  output.context=context;output.evidence=sim.evidence(stations,output.options,context);
+  assert.match(report.html(output),/제주 자료 기반 추정값/);
+  assert.ok(report.rows(output).some(r=>String(r).includes('131656건')));
+});
+
 test('15-minute load conserves energy with partial bins and uses coincident aggregate peaks', () => {
   const stations = sim.demo(), o = {...sim.defaults,minutes:45,energy:15};
   const profile = sim.loadProfile(stations,o,[[],[]],[
@@ -21,7 +40,7 @@ test('15-minute load conserves energy with partial bins and uses coincident aggr
 
 test('load includes initial residual energy and all deferred charging past the arrival horizon', () => {
   const stations = sim.demo();
-  const profile = sim.loadProfile(stations,{...sim.defaults,minutes:30},[[20],[]],[{station:0,start:20,end:50}]);
+  const profile = sim.loadProfile(stations,{...sim.defaults,energy:30,minutes:30},[[20],[]],[{station:0,start:20,end:50}]);
   assert.equal(profile.initialEnergyKwh,20);
   assert.equal(profile.newEnergyKwh,30);
   assert.equal(profile.tailEnergyKwh,20);
@@ -31,7 +50,7 @@ test('load includes initial residual energy and all deferred charging past the a
 });
 
 test('inconsistent assumed durations flag implied power above rating without losing energy', () => {
-  const profile = sim.loadProfile(sim.demo(),sim.defaults,[[],[]],[{station:0,start:0,end:20}]);
+  const profile = sim.loadProfile(sim.demo(),{...sim.defaults,energy:30},[[],[]],[{station:0,start:0,end:20}]);
   assert.equal(profile.overRatedSessions,1);
   assert.equal(profile.stationPeakKw[0],90);
   assert.equal(profile.series.reduce((s,v)=>s+v[0]*.25,0),30);
@@ -222,7 +241,7 @@ test('validation rejects mixed speeds, identical stations, invalid counts and in
   await assert.rejects(sim.compare([stations[0], stations[0]]));
 });
 test('default duration uses per-station output and initial remaining time without exceeding rating', () => {
-  const stations = sim.demo(), o = { ...sim.defaults };
+  const stations = sim.demo(), o = { ...sim.defaults, energy:30 };
   stations[0].kw = 30; Object.assign(stations[1], { avail: 0, charging: 0 });
   const r = sim.runPolicy(stations, o, { initial: [[.5, .5, .5, .5], []], drivers: [{ id: 0, arrival: 0, duration: 20, choice: .1 }] }, 0);
   assert.equal(r.records[0].start, 30); assert.equal(r.records[0].end, 90);

@@ -4,8 +4,10 @@
   else root.ESSimulation = factory();
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
   'use strict';
+  const energyProfile = typeof module === 'object' && module.exports ? require('../data/jeju_energy_summary.json') : /*__JEJU_ENERGY__*/null;
+  const energyDefault = speed => energyProfile.bySpeed[speed === 'slow' ? 'slow' : 'fast'].defaultKwh;
   const policies = ['고정요금', '할인·할증', '할인 전용'];
-  const defaults = { drivers: 24, minutes: 60, energy: 30, discount: .2, surcharge: .15,
+  const defaults = { drivers: 24, minutes: 60, energy: energyDefault('fast'), discount: .2, surcharge: .15,
     alpha: 600, beta: 300, tau: 2000, sensitivity: 1, repeats: 100, seed: 42,
     distance: 2, threshold: .5, durationMode: 'power' };
   const demo = () => [
@@ -262,7 +264,7 @@
       discount, revenue: charge, completion, records, load: loadProfile(stations, o, initial, records) };
   }
   async function compare(stations, options = {}, onProgress = () => {}, utilizationById, control = {}) {
-    const o = { ...defaults, ...options }; validate(stations, o);
+    const o = { ...defaults, energy: energyDefault(stations[0]?.speed), ...options }; validate(stations, o);
     const random = rng(o.seed), results = policies.map((label, policy) => ({ label, policy, count: [0, 0], share: [0, 0], wait: 0, expectedWait: 0, fee: 0, distance: 0, discount: 0, revenue: 0, completion: 0, samples: [] }));
     const populationCounts = [];
     const peakSamples = policies.map(() => []), peakDeltaSamples = policies.map(() => []);
@@ -329,7 +331,7 @@
   }
   const sweepKeys = ['drivers', 'minutes', 'energy', 'sensitivity', 'alpha', 'beta', 'tau', 'distance', 'discount', 'surcharge', 'threshold', 'durationMode'];
   async function sweep(stations, options, key, values, onProgress = () => {}, utilizationById, cancelled = () => false) {
-    const base = { ...defaults, ...options }; validate(stations, base);
+    const base = { ...defaults, energy: energyDefault(stations[0]?.speed), ...options }; validate(stations, base);
     if (base.forecastPlan && ['drivers','minutes'].includes(key)) throw new Error('v2의 인원·기간은 예측에서 정합니다. 다른 가정값을 비교하거나 수동 모드로 바꾸세요.');
     if (!sweepKeys.includes(key) || !Array.isArray(values) || !values.length || values.length > 8) throw new Error('비교 항목과 1~8개 수준을 확인하세요.');
     const levels = [...new Set([base[key], ...values])].sort((a, b) => typeof a === 'number' ? a - b : String(a).localeCompare(String(b)));
@@ -374,6 +376,11 @@
     }
     for (const [key, label, unit] of [['drivers','신규 운전자','명'],['minutes','도착 생성 기간','분'],['energy','차량당 충전량','kWh'],['sensitivity','가격 민감도','배'],['alpha','이동 비용 α','원/km'],['beta','대기 비용 β','원/분'],['tau','선택 다양성 τ','원']]) {
       const derived = o.forecastPlan && ['drivers','minutes'].includes(key);
+      if (key === 'energy' && context.energySource === 'jeju' && o.energy === energyDefault(context.speed)) {
+        const g = energyProfile.bySpeed[context.speed === 'slow' ? 'slow' : 'fast'];
+        add(label, `${o.energy}${unit}`, '추정값', `제주 자료 기반 추정값 · ${context.speed === 'slow' ? '완속' : '급속'} · ${g.start}~${g.end} · ${g.totalKwh}kWh ÷ ${g.sessions}건. ${energyProfile.method} ${energyProfile.unitNote} ${energyProfile.limitation} 출처: ${energyProfile.sourceUrl} · 단위 대조: ${energyProfile.unitReferenceUrl}`);
+        continue;
+      }
       add(label, `${o[key]}${unit}`, derived ? '추정값' : '가정값', derived ? 'v2 남은 구간의 충전 시작 건수 추정. 실제 도착·대기·포기 차량을 관측한 값 아님' : key==='energy' ? '공공 API에 kWh 없음. 사용자 가정값이며 예측 건수·충전시간으로 역산하지 않음' : '요구사항 예시를 초기값으로 사용. 변경값은 사용자 시나리오이며 실측·통계 보정 전');
     }
     for (const [key, label] of [['discount','여유 할인율'],['surcharge','혼잡 할증율'],['threshold','여유 판정 대기율']])
@@ -396,5 +403,5 @@
     }
     return rows;
   }
-  return { defaults, policies, demo, rng, status, price, probability, validate, population, runPolicy, loadProfile, compare, forecast, forecastV2, poisson, sweep, sweepKeys, evidence };
+  return { defaults, energyProfile, energyDefault, policies, demo, rng, status, price, probability, validate, population, runPolicy, loadProfile, compare, forecast, forecastV2, poisson, sweep, sweepKeys, evidence };
 });

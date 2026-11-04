@@ -7,7 +7,7 @@
   const fields = [
     ['drivers', '신규 운전자 (명)', 24, 1, 500, 1], ['minutes', '도착 생성 기간 (분)', 60, 1, 1440, 1],
     ['discount', '여유 할인율 (%)', config.discount * 100, 0, 100, 1], ['surcharge', '혼잡 할증율 (%)', config.surcharge * 100, 0, 100, 1],
-    ['energy', '차량당 충전량 (kWh)', 30, .1, 200, .1], ['sensitivity', '가격 민감도 (배)', 1, 0, 10, .1],
+    ['energy', '차량당 충전량 (kWh)', sim.energyDefault('fast'), .1, 200, .01], ['sensitivity', '가격 민감도 (배)', 1, 0, 10, .1],
     ['alpha', '이동 비용 α (원/km)', 600, 0, 100000, 10], ['beta', '대기 비용 β (원/분)', 300, 0, 100000, 10],
     ['tau', '선택 다양성 τ (원)', 2000, 1, 100000, 1], ['threshold', '여유 판정 대기율 (%)', config.threshold * 100, 10, 90, 1],
     ['distance', 'B 추가 거리 (km)', 2, 0, 200, .001], ['repeats', '반복 실험 (회)', 100, 1, 500, 1], ['seed', '난수 시드', 42, 0, 4294967295, 1]
@@ -30,6 +30,8 @@
         <label>충전기 종류<select id="sim-speed"><option value="fast">급속</option><option value="slow">완속</option></select></label>
         <label class="sim-wide">충전소 A<select id="sim-a" required></select></label>
         <label class="sim-wide">충전소 B<select id="sim-b" required></select></label>
+        <label class="sim-wide">충전량 입력 근거<select id="sim-energySource"><option value="jeju">제주 자료 기반 추정값 · 급속/완속 자동 적용</option><option value="manual">사용자 가정값 · 직접 입력</option></select></label>
+        <p class="sim-wide sim-note" id="sim-energy-note"></p>
         ${fields.map(([id, label, value, min, max, step]) => `<label>${label}<span id="sim-kind-${id}">${badge(id === 'distance' ? '추정값' : fieldKind(id))}</span><input id="sim-${id}" type="number" value="${value}" min="${min}" max="${max}" step="${step}" required></label>`).join('')}
         <label class="sim-wide">추가 거리 산정<select id="sim-distanceMode"><option value="coords">A↔B 좌표 직선거리 (A: 0km)</option><option value="manual">사용자 가정값 (A: 0km, B: 입력값)</option></select></label>
         <label class="sim-wide">신규 차량 충전시간 ${badge('가정값')}<select id="sim-durationMode"><option value="power"${sim.defaults.durationMode === 'power' ? ' selected' : ''}>충전량 ÷ 대표 출력 × 60분 (기본)</option><option value="assumed"${sim.defaults.durationMode === 'assumed' ? ' selected' : ''}>20~40분 균등분포 (간소화 가정)</option></select></label>
@@ -86,6 +88,12 @@
       </details>
     </div></div>`;
   function message(text, error = false) { $('sim-message').textContent = text; $('sim-message').dataset.error = error; }
+  function updateEnergy() {
+    const speed = $('sim-speed').value, g = sim.energyProfile.bySpeed[speed], automatic = $('sim-energySource').value === 'jeju';
+    if (automatic) $('sim-energy').value = g.defaultKwh;
+    $('sim-kind-energy').innerHTML = badge(automatic ? '추정값' : '가정값');
+    $('sim-energy-note').innerHTML = `${automatic ? `제주 자료 기반 추정값: ${speed === 'fast' ? '급속' : '완속'} ${g.defaultKwh}kWh/건.` : '직접 입력한 충전량을 사용자 가정값으로 적용합니다.'} ${g.start}~${g.end} 양수 충전 ${g.sessions.toLocaleString('ko-KR')}건 기준. 버스 전용·0kWh·중복 제외. 현재 충북 실측값이 아닙니다. 원본 단위 미기재로 충전요금과 대조해 kWh로 해석했습니다. <a href="${escape(sim.energyProfile.sourceUrl)}" target="_blank" rel="noopener">제주 원본</a> · <a href="https://github.com/ms3011975/ev-hackathon.github.io/blob/main/docs/jeju-energy.md" target="_blank" rel="noopener">계산·단위·제외 기준</a>`;
+  }
   function selected() { return [$('sim-a').value, $('sim-b').value].map(id => pool.find(s => s.id === id)); }
   function invalidate() {
     if (last) $('sim-export').disabled = true;
@@ -169,7 +177,7 @@
   }
   function context(prediction) {
     return { source, executedAt: new Date().toISOString(), region: $('sim-mode').value === 'demo' ? '예시 · 지역 무관' : $('sim-region').selectedOptions[0].text,
-      mode: $('sim-mode').value, speed: $('sim-speed').value, distanceMode: $('sim-distanceMode').value,
+      mode: $('sim-mode').value, speed: $('sim-speed').value, distanceMode: $('sim-distanceMode').value, energySource: $('sim-energySource').value,
       forecastRequested: $('sim-pricingBasis').value !== 'observed',
       pricingBasis: $('sim-pricingBasis').value === 'forecast-v2' ? 'v2 구간별 예측 요금·충전 시작 건수 기반 수요' : $('sim-pricingBasis').value === 'forecast' ? 'v1 1시간 후 이용률 (요금에만 적용)' : '현재 수집 상태',
       forecastInfo: prediction ? `${prediction.model} · 생성 ${kst(prediction.generatedAt)} · 대상 ${kst(prediction.targetTime)}` : '',
@@ -312,7 +320,7 @@
       if (lastSweep) $('sim-sweep-export').disabled = true;
       const output = await sim.sweep(currentStations, capturedOptions, key, values, p => { $('sim-sweep-status').textContent = `민감도 분석 중… ${Math.round(p*100)}%`; }, prediction?.utilizationById, () => cancelSweep);
       output.context = capturedContext; output.evidence = sim.evidence(currentStations,capturedOptions,capturedContext);
-      for (const level of output.scenarios) level.evidence = sim.evidence(currentStations,level.options,{...capturedContext,distanceMode:key === 'distance' && level.value !== output.baseline ? 'manual' : capturedContext.distanceMode});
+      for (const level of output.scenarios) level.evidence = sim.evidence(currentStations,level.options,{...capturedContext,distanceMode:key === 'distance' && level.value !== output.baseline ? 'manual' : capturedContext.distanceMode,energySource:key === 'energy' && level.value !== output.baseline ? 'manual' : capturedContext.energySource});
       lastSweep = output; renderSweep(output);
       $('sim-sweep-status').textContent = `완료 · ${output.scenarios.length}개 수준 × 3개 정책. 결과는 가상 시나리오 비교입니다.`;
     } catch (error) { $('sim-sweep-status').textContent = error.message; }
@@ -442,7 +450,9 @@
     } catch(error) {message(error.message,true);} finally {lock(false);}
   });
   $('sim-form').addEventListener('change', invalidate);
-  for (const id of ['mode', 'region', 'speed']) $('sim-' + id).addEventListener('change', load);
+  $('sim-energySource').addEventListener('change', ()=>{updateEnergy();invalidate();});
+  $('sim-energy').addEventListener('input', ()=>{$('sim-energySource').value='manual';updateEnergy();invalidate();});
+  for (const id of ['mode', 'region', 'speed']) $('sim-' + id).addEventListener('change', ()=>{updateEnergy();load();});
   for (const id of ['a', 'b', 'distanceMode', 'threshold']) $('sim-' + id).addEventListener('change', ()=>{cards();if ($('sim-pricingBasis').value!=='observed') checkForecast();});
   $('sim-reload').addEventListener('click', load);
   for (const [id, active] of [['tab-monitor', false], ['tab-simulation', true]]) $(id).addEventListener('click', () => {
@@ -452,5 +462,5 @@
     if (!active) window.ESSMonitor?.resize();
   });
   if (location.hash === '#simulation') $('tab-simulation').click();
-  load();
+  updateEnergy(); load();
 })();

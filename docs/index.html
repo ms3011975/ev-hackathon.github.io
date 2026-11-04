@@ -1682,8 +1682,57 @@ window.ESSMonitor.ready = detectServer();
   else root.ESSimulation = factory();
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
   'use strict';
+  const energyProfile = typeof module === 'object' && module.exports ? require('../data/jeju_energy_summary.json') : {
+  "schemaVersion": 1,
+  "sourceTitle": "제주특별자치도_전체 전기차자동차 충전 이력 데이터(파일)_20221130",
+  "sourceUrl": "https://www.data.go.kr/data/15109706/fileData.do",
+  "sourceFileSha256": "8e3cf6c904b229ff7167bfef3a527e30c7e7084efebb2b2259621a675d4c7e8a",
+  "sourceEncoding": "CP949",
+  "method": "중복 제거 후 양수 충전량의 합계 ÷ 해당 충전 건수. 버스 전용·타입 미상·0 이하/결측 제외. 소수 둘째 자리 반올림.",
+  "unitNote": "CSV 단위 미기재. 제주 공시 250원/kWh와 원본 충전금액·충전량을 대조해 kWh로 해석한 추정값.",
+  "unitReferenceUrl": "https://www.epeople.go.kr/api/thk/conversational/selectConversationalDetail.npaid?ideaRegNo=1AE-2007-0001036",
+  "unitCrossCheck": {
+    "billedSessionsJanJun2021": 202747,
+    "withinOneWonOf250PerKwh": 198756
+  },
+  "limitation": "2021~2022년 제주 자료를 충북에 이전 적용한 추정값. 현재 충북 실측값·차종별 대표값 아님. 양수 충전 건의 조건부 평균이며 0kWh 시도·취소를 제외. 개별 분포·시간대 차이 미반영.",
+  "rawRows": 1251255,
+  "excluded": {
+    "bus_charger": 135309,
+    "non_positive_energy": 21227,
+    "unknown_type": 57,
+    "exact_duplicate": 10
+  },
+  "includedTypes": {
+    "AC급속3상": 124687,
+    "DC차데모": 108982,
+    "DC차데모+AC3상": 1560,
+    "DC차데모+AC3상+DC콤보": 246499,
+    "DC콤보": 481268,
+    "완속": 131656
+  },
+  "bySpeed": {
+    "fast": {
+      "defaultKwh": 14.82,
+      "meanKwh": 14.81538494448575,
+      "totalKwh": 14267156.44,
+      "sessions": 962996,
+      "start": "2021-01-01",
+      "end": "2022-06-30"
+    },
+    "slow": {
+      "defaultKwh": 16.24,
+      "meanKwh": 16.238702983532843,
+      "totalKwh": 2137922.68,
+      "sessions": 131656,
+      "start": "2021-01-01",
+      "end": "2022-06-23"
+    }
+  }
+};
+  const energyDefault = speed => energyProfile.bySpeed[speed === 'slow' ? 'slow' : 'fast'].defaultKwh;
   const policies = ['고정요금', '할인·할증', '할인 전용'];
-  const defaults = { drivers: 24, minutes: 60, energy: 30, discount: .2, surcharge: .15,
+  const defaults = { drivers: 24, minutes: 60, energy: energyDefault('fast'), discount: .2, surcharge: .15,
     alpha: 600, beta: 300, tau: 2000, sensitivity: 1, repeats: 100, seed: 42,
     distance: 2, threshold: .5, durationMode: 'power' };
   const demo = () => [
@@ -1940,7 +1989,7 @@ window.ESSMonitor.ready = detectServer();
       discount, revenue: charge, completion, records, load: loadProfile(stations, o, initial, records) };
   }
   async function compare(stations, options = {}, onProgress = () => {}, utilizationById, control = {}) {
-    const o = { ...defaults, ...options }; validate(stations, o);
+    const o = { ...defaults, energy: energyDefault(stations[0]?.speed), ...options }; validate(stations, o);
     const random = rng(o.seed), results = policies.map((label, policy) => ({ label, policy, count: [0, 0], share: [0, 0], wait: 0, expectedWait: 0, fee: 0, distance: 0, discount: 0, revenue: 0, completion: 0, samples: [] }));
     const populationCounts = [];
     const peakSamples = policies.map(() => []), peakDeltaSamples = policies.map(() => []);
@@ -2007,7 +2056,7 @@ window.ESSMonitor.ready = detectServer();
   }
   const sweepKeys = ['drivers', 'minutes', 'energy', 'sensitivity', 'alpha', 'beta', 'tau', 'distance', 'discount', 'surcharge', 'threshold', 'durationMode'];
   async function sweep(stations, options, key, values, onProgress = () => {}, utilizationById, cancelled = () => false) {
-    const base = { ...defaults, ...options }; validate(stations, base);
+    const base = { ...defaults, energy: energyDefault(stations[0]?.speed), ...options }; validate(stations, base);
     if (base.forecastPlan && ['drivers','minutes'].includes(key)) throw new Error('v2의 인원·기간은 예측에서 정합니다. 다른 가정값을 비교하거나 수동 모드로 바꾸세요.');
     if (!sweepKeys.includes(key) || !Array.isArray(values) || !values.length || values.length > 8) throw new Error('비교 항목과 1~8개 수준을 확인하세요.');
     const levels = [...new Set([base[key], ...values])].sort((a, b) => typeof a === 'number' ? a - b : String(a).localeCompare(String(b)));
@@ -2052,6 +2101,11 @@ window.ESSMonitor.ready = detectServer();
     }
     for (const [key, label, unit] of [['drivers','신규 운전자','명'],['minutes','도착 생성 기간','분'],['energy','차량당 충전량','kWh'],['sensitivity','가격 민감도','배'],['alpha','이동 비용 α','원/km'],['beta','대기 비용 β','원/분'],['tau','선택 다양성 τ','원']]) {
       const derived = o.forecastPlan && ['drivers','minutes'].includes(key);
+      if (key === 'energy' && context.energySource === 'jeju' && o.energy === energyDefault(context.speed)) {
+        const g = energyProfile.bySpeed[context.speed === 'slow' ? 'slow' : 'fast'];
+        add(label, `${o.energy}${unit}`, '추정값', `제주 자료 기반 추정값 · ${context.speed === 'slow' ? '완속' : '급속'} · ${g.start}~${g.end} · ${g.totalKwh}kWh ÷ ${g.sessions}건. ${energyProfile.method} ${energyProfile.unitNote} ${energyProfile.limitation} 출처: ${energyProfile.sourceUrl} · 단위 대조: ${energyProfile.unitReferenceUrl}`);
+        continue;
+      }
       add(label, `${o[key]}${unit}`, derived ? '추정값' : '가정값', derived ? 'v2 남은 구간의 충전 시작 건수 추정. 실제 도착·대기·포기 차량을 관측한 값 아님' : key==='energy' ? '공공 API에 kWh 없음. 사용자 가정값이며 예측 건수·충전시간으로 역산하지 않음' : '요구사항 예시를 초기값으로 사용. 변경값은 사용자 시나리오이며 실측·통계 보정 전');
     }
     for (const [key, label] of [['discount','여유 할인율'],['surcharge','혼잡 할증율'],['threshold','여유 판정 대기율']])
@@ -2074,7 +2128,7 @@ window.ESSMonitor.ready = detectServer();
     }
     return rows;
   }
-  return { defaults, policies, demo, rng, status, price, probability, validate, population, runPolicy, loadProfile, compare, forecast, forecastV2, poisson, sweep, sweepKeys, evidence };
+  return { defaults, energyProfile, energyDefault, policies, demo, rng, status, price, probability, validate, population, runPolicy, loadProfile, compare, forecast, forecastV2, poisson, sweep, sweepKeys, evidence };
 });
 </script>
 <script>/* Shared browser/Node report rendering. All external labels are escaped. */
@@ -2205,7 +2259,7 @@ window.ESSMonitor.ready = detectServer();
   const fields = [
     ['drivers', '신규 운전자 (명)', 24, 1, 500, 1], ['minutes', '도착 생성 기간 (분)', 60, 1, 1440, 1],
     ['discount', '여유 할인율 (%)', config.discount * 100, 0, 100, 1], ['surcharge', '혼잡 할증율 (%)', config.surcharge * 100, 0, 100, 1],
-    ['energy', '차량당 충전량 (kWh)', 30, .1, 200, .1], ['sensitivity', '가격 민감도 (배)', 1, 0, 10, .1],
+    ['energy', '차량당 충전량 (kWh)', sim.energyDefault('fast'), .1, 200, .01], ['sensitivity', '가격 민감도 (배)', 1, 0, 10, .1],
     ['alpha', '이동 비용 α (원/km)', 600, 0, 100000, 10], ['beta', '대기 비용 β (원/분)', 300, 0, 100000, 10],
     ['tau', '선택 다양성 τ (원)', 2000, 1, 100000, 1], ['threshold', '여유 판정 대기율 (%)', config.threshold * 100, 10, 90, 1],
     ['distance', 'B 추가 거리 (km)', 2, 0, 200, .001], ['repeats', '반복 실험 (회)', 100, 1, 500, 1], ['seed', '난수 시드', 42, 0, 4294967295, 1]
@@ -2228,6 +2282,8 @@ window.ESSMonitor.ready = detectServer();
         <label>충전기 종류<select id="sim-speed"><option value="fast">급속</option><option value="slow">완속</option></select></label>
         <label class="sim-wide">충전소 A<select id="sim-a" required></select></label>
         <label class="sim-wide">충전소 B<select id="sim-b" required></select></label>
+        <label class="sim-wide">충전량 입력 근거<select id="sim-energySource"><option value="jeju">제주 자료 기반 추정값 · 급속/완속 자동 적용</option><option value="manual">사용자 가정값 · 직접 입력</option></select></label>
+        <p class="sim-wide sim-note" id="sim-energy-note"></p>
         ${fields.map(([id, label, value, min, max, step]) => `<label>${label}<span id="sim-kind-${id}">${badge(id === 'distance' ? '추정값' : fieldKind(id))}</span><input id="sim-${id}" type="number" value="${value}" min="${min}" max="${max}" step="${step}" required></label>`).join('')}
         <label class="sim-wide">추가 거리 산정<select id="sim-distanceMode"><option value="coords">A↔B 좌표 직선거리 (A: 0km)</option><option value="manual">사용자 가정값 (A: 0km, B: 입력값)</option></select></label>
         <label class="sim-wide">신규 차량 충전시간 ${badge('가정값')}<select id="sim-durationMode"><option value="power"${sim.defaults.durationMode === 'power' ? ' selected' : ''}>충전량 ÷ 대표 출력 × 60분 (기본)</option><option value="assumed"${sim.defaults.durationMode === 'assumed' ? ' selected' : ''}>20~40분 균등분포 (간소화 가정)</option></select></label>
@@ -2284,6 +2340,12 @@ window.ESSMonitor.ready = detectServer();
       </details>
     </div></div>`;
   function message(text, error = false) { $('sim-message').textContent = text; $('sim-message').dataset.error = error; }
+  function updateEnergy() {
+    const speed = $('sim-speed').value, g = sim.energyProfile.bySpeed[speed], automatic = $('sim-energySource').value === 'jeju';
+    if (automatic) $('sim-energy').value = g.defaultKwh;
+    $('sim-kind-energy').innerHTML = badge(automatic ? '추정값' : '가정값');
+    $('sim-energy-note').innerHTML = `${automatic ? `제주 자료 기반 추정값: ${speed === 'fast' ? '급속' : '완속'} ${g.defaultKwh}kWh/건.` : '직접 입력한 충전량을 사용자 가정값으로 적용합니다.'} ${g.start}~${g.end} 양수 충전 ${g.sessions.toLocaleString('ko-KR')}건 기준. 버스 전용·0kWh·중복 제외. 현재 충북 실측값이 아닙니다. 원본 단위 미기재로 충전요금과 대조해 kWh로 해석했습니다. <a href="${escape(sim.energyProfile.sourceUrl)}" target="_blank" rel="noopener">제주 원본</a> · <a href="https://github.com/ms3011975/ev-hackathon.github.io/blob/main/docs/jeju-energy.md" target="_blank" rel="noopener">계산·단위·제외 기준</a>`;
+  }
   function selected() { return [$('sim-a').value, $('sim-b').value].map(id => pool.find(s => s.id === id)); }
   function invalidate() {
     if (last) $('sim-export').disabled = true;
@@ -2367,7 +2429,7 @@ window.ESSMonitor.ready = detectServer();
   }
   function context(prediction) {
     return { source, executedAt: new Date().toISOString(), region: $('sim-mode').value === 'demo' ? '예시 · 지역 무관' : $('sim-region').selectedOptions[0].text,
-      mode: $('sim-mode').value, speed: $('sim-speed').value, distanceMode: $('sim-distanceMode').value,
+      mode: $('sim-mode').value, speed: $('sim-speed').value, distanceMode: $('sim-distanceMode').value, energySource: $('sim-energySource').value,
       forecastRequested: $('sim-pricingBasis').value !== 'observed',
       pricingBasis: $('sim-pricingBasis').value === 'forecast-v2' ? 'v2 구간별 예측 요금·충전 시작 건수 기반 수요' : $('sim-pricingBasis').value === 'forecast' ? 'v1 1시간 후 이용률 (요금에만 적용)' : '현재 수집 상태',
       forecastInfo: prediction ? `${prediction.model} · 생성 ${kst(prediction.generatedAt)} · 대상 ${kst(prediction.targetTime)}` : '',
@@ -2510,7 +2572,7 @@ window.ESSMonitor.ready = detectServer();
       if (lastSweep) $('sim-sweep-export').disabled = true;
       const output = await sim.sweep(currentStations, capturedOptions, key, values, p => { $('sim-sweep-status').textContent = `민감도 분석 중… ${Math.round(p*100)}%`; }, prediction?.utilizationById, () => cancelSweep);
       output.context = capturedContext; output.evidence = sim.evidence(currentStations,capturedOptions,capturedContext);
-      for (const level of output.scenarios) level.evidence = sim.evidence(currentStations,level.options,{...capturedContext,distanceMode:key === 'distance' && level.value !== output.baseline ? 'manual' : capturedContext.distanceMode});
+      for (const level of output.scenarios) level.evidence = sim.evidence(currentStations,level.options,{...capturedContext,distanceMode:key === 'distance' && level.value !== output.baseline ? 'manual' : capturedContext.distanceMode,energySource:key === 'energy' && level.value !== output.baseline ? 'manual' : capturedContext.energySource});
       lastSweep = output; renderSweep(output);
       $('sim-sweep-status').textContent = `완료 · ${output.scenarios.length}개 수준 × 3개 정책. 결과는 가상 시나리오 비교입니다.`;
     } catch (error) { $('sim-sweep-status').textContent = error.message; }
@@ -2640,7 +2702,9 @@ window.ESSMonitor.ready = detectServer();
     } catch(error) {message(error.message,true);} finally {lock(false);}
   });
   $('sim-form').addEventListener('change', invalidate);
-  for (const id of ['mode', 'region', 'speed']) $('sim-' + id).addEventListener('change', load);
+  $('sim-energySource').addEventListener('change', ()=>{updateEnergy();invalidate();});
+  $('sim-energy').addEventListener('input', ()=>{$('sim-energySource').value='manual';updateEnergy();invalidate();});
+  for (const id of ['mode', 'region', 'speed']) $('sim-' + id).addEventListener('change', ()=>{updateEnergy();load();});
   for (const id of ['a', 'b', 'distanceMode', 'threshold']) $('sim-' + id).addEventListener('change', ()=>{cards();if ($('sim-pricingBasis').value!=='observed') checkForecast();});
   $('sim-reload').addEventListener('click', load);
   for (const [id, active] of [['tab-monitor', false], ['tab-simulation', true]]) $(id).addEventListener('click', () => {
@@ -2650,7 +2714,7 @@ window.ESSMonitor.ready = detectServer();
     if (!active) window.ESSMonitor?.resize();
   });
   if (location.hash === '#simulation') $('tab-simulation').click();
-  load();
+  updateEnergy(); load();
 })();
 </script>
 
