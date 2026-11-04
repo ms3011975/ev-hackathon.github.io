@@ -15,6 +15,23 @@ function fixture() {
 const parse=payload=>sim.forecastV2(payload,sim.demo(),{now,observedAt:now-60000});
 function options(prediction, extra={}) {return {...sim.defaults,drivers:prediction.plan.expectedDrivers,minutes:prediction.plan.minutes,forecastPlan:prediction.plan,repeats:10,...extra};}
 
+test('behavior presets share fractional v2 demand, quotes and initial energy including zero demand',async()=>{
+  for(const zero of [false,true]){
+    const raw=fixture(); if(zero) raw.predictions.forEach(r=>r.expected_new_sessions=0);
+    const p=parse(raw), o=options(p), before=JSON.stringify(o);
+    const out=await sim.compareBehavior(sim.demo(),o,()=>{},p.utilizationById);
+    const [a,b]=out.profiles;
+    assert.deepEqual(a.population,b.population);
+    for(let i=0;i<3;i++){
+      assert.deepEqual(a.results[i].priceSchedule,b.results[i].priceSchedule);
+      assert.equal(a.results[i].load.newEnergyKwh,b.results[i].load.newEnergyKwh);
+      assert.equal(a.results[i].load.initialEnergyKwh,b.results[i].load.initialEnergyKwh);
+    }
+    if(zero) assert.equal(b.population.emptyRuns,10);
+    assert.equal(JSON.stringify(o),before);
+  }
+});
+
 test('v2 clips elapsed demand, prorates a partial bin and retains model provenance',()=>{
   const raw=fixture(), before=JSON.stringify(raw), p=parse(raw);
   assert.equal(p.plan.minutes,25);

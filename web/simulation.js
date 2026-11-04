@@ -6,6 +6,32 @@
   'use strict';
   const energyProfile = typeof module === 'object' && module.exports ? require('../data/jeju_energy_summary.json') : /*__JEJU_ENERGY__*/null;
   const energyDefault = speed => energyProfile.bySpeed[speed === 'slow' ? 'slow' : 'fast'].defaultKwh;
+  const behaviorKeys = ['sensitivity', 'alpha', 'beta', 'tau'];
+  const behaviorProfiles = {
+    legacy: { id: 'legacy', label: '기존 예시값', values: { sensitivity: 1, alpha: 600, beta: 300, tau: 2000 } },
+    literature: { id: 'literature', label: '문헌 환산 후보', values: { sensitivity: 1, alpha: 950, beta: 360, tau: 7200 } }
+  };
+  const behaviorReference = {
+    version: 'dong-2024-transfer-v1',
+    title: 'Dong 외 (2024), Cost Sensitivity and Charging Choices of Plug-in Electric Vehicle Drivers – A Stated Preference Study',
+    url: 'https://rosap.ntl.bts.gov/view/dot/79042/dot_79042_DS1.pdf',
+    pages: '본문 13쪽 표 5 Model 1 · 15쪽 표 6 (PDF 23·25쪽)',
+    population: '캘리포니아 PEV 소유자 1,102명 · 장거리 이동 중 공공 급속 충전 선택실험',
+    cost: .132, detour: .066, wait: .050, rangeElasticity: .35168,
+    energyKwh: 14.82, efficiencyKmPerKwh: 6, wonPerDollar: 1400, detourKmh: 30,
+    income: '원문 평균소득 기준 유지. 한국 소득·구매력 보정 없음',
+    limitation: '국외 문헌 이전 적용 추정값. 충북 실측 보정 전. 통화 환산·전비·속도는 시나리오 가정이며 현재 환율·실측 교통속도가 아님. 충전시간·편의시설·대기 발생 여부 항은 같다고 놓은 축약 변환. 원문 모형 전체의 재현 아님.'
+  };
+  function behaviorConversion() {
+    const b = behaviorReference, r = b.energyKwh * b.efficiencyKmPerKwh / 160.9344;
+    const tau = b.wonPerDollar * r ** (1 - b.rangeElasticity) / b.cost;
+    return { r, tau, alpha: b.detour * tau * 60 / b.detourKmh, beta: b.wait * tau };
+  }
+  function behaviorMatch(o, context = {}) {
+    const preset = behaviorProfiles[context.behaviorPreset];
+    return preset && behaviorKeys.every(k => o[k] === preset.values[k]) &&
+      (preset.id !== 'literature' || context.speed === 'fast') ? preset.id : 'custom';
+  }
   const policies = ['고정요금', '할인·할증', '할인 전용'];
   const defaults = { drivers: 24, minutes: 60, energy: energyDefault('fast'), discount: .2, surcharge: .15,
     alpha: 600, beta: 300, tau: 2000, sensitivity: 1, repeats: 100, seed: 42,
@@ -329,6 +355,23 @@
     onProgress(1); return { options: o, stations: stations.map(s => ({ ...s })), results,
       population: {expected:o.drivers,mean:meanDrivers,min:Math.min(...populationCounts),max:Math.max(...populationCounts),emptyRuns:populationCounts.filter(n=>!n).length} };
   }
+  async function compareBehavior(stations, options = {}, onProgress = () => {}, utilizationById, cancelled = () => false) {
+    if (stations.length !== 2 || stations.some(s => s.speed !== 'fast')) throw new Error('문헌 후보 비교는 급속 충전소 2곳에서 지원합니다. 완속 행동은 별도 보정이 필요합니다.');
+    const base = { ...defaults, ...options }; validate(stations, base);
+    const upper = base.forecastPlan ? Math.min(2000, Math.ceil(base.drivers + 8 * Math.sqrt(base.drivers) + 10)) : base.drivers;
+    if (2 * base.repeats * upper * 3 > 2000000) throw new Error('분석량이 큽니다. 인원 또는 반복 횟수를 줄여 주세요 (최대 200만 차량·정책 계산).');
+    const random = rng(base.seed), populations = [];
+    for (let i = 0; i < base.repeats; i++) {
+      if (cancelled()) throw new Error('분석을 중단했습니다.');
+      populations.push(population(stations, base, random));
+    }
+    const profiles = [];
+    for (const [i, preset] of Object.values(behaviorProfiles).entries()) {
+      const result = await compare(stations, { ...base, ...preset.values }, p => onProgress((i + p) / 2), utilizationById, { populations, cancelled });
+      profiles.push({ id: preset.id, label: preset.label, ...result });
+    }
+    return { base, profiles };
+  }
   const sweepKeys = ['drivers', 'minutes', 'energy', 'sensitivity', 'alpha', 'beta', 'tau', 'distance', 'discount', 'surcharge', 'threshold', 'durationMode'];
   async function sweep(stations, options, key, values, onProgress = () => {}, utilizationById, cancelled = () => false) {
     const base = { ...defaults, energy: energyDefault(stations[0]?.speed), ...options }; validate(stations, base);
@@ -367,6 +410,14 @@
   function evidence(stations, o, context = {}) {
     const rows = [], add = (item, value, kind, basis) => rows.push({ item, value, kind, basis });
     const real = context.mode === 'real';
+    const behavior = behaviorMatch(o, context), literature = behavior === 'literature';
+    add('행동계수 설정', behaviorProfiles[behavior]?.label || '사용자 가정값', literature ? '추정값' : '가정값',
+      literature ? '고정 참조 후보: s=1, α=950, β=360, τ=7200. 급속 14.82kWh 기준 환산을 반올림. 충전량을 바꿔도 계수는 자동 재산정하지 않음' : '실측 행동 보정 전. 수치를 수정하거나 완속에 이전하면 사용자 가정값으로 취급');
+    if (literature) {
+      add('행동계수 문헌', behaviorReference.title, '추정값', `${behaviorReference.population} · ${behaviorReference.pages} · ${behaviorReference.url}`);
+      add('행동계수 환산 가정', '14.82kWh · 6km/kWh · 1,400원/USD · 30km/h · s=1 정규화', '실험 설정',
+        `r=14.82×6÷160.9344; τ=1400×r^(1−0.35168)÷0.132; α=0.066×τ×60÷30; β=0.050×τ. 반올림 전 ${JSON.stringify(behaviorConversion())}. ${behaviorReference.income}. ${behaviorReference.limitation} 현재 입력 충전량 ${o.energy}kWh.`);
+    }
     for (const [i, s] of stations.entries()) {
       const prefix = i ? 'B' : 'A';
       add(`${prefix} 충전소 ID·위치`, `${s.id} · ${s.lat}, ${s.lng}`, real ? '실측·수집값' : '가정값', real ? context.source : '실제 충전소가 아닌 예시 데이터');
@@ -376,6 +427,11 @@
     }
     for (const [key, label, unit] of [['drivers','신규 운전자','명'],['minutes','도착 생성 기간','분'],['energy','차량당 충전량','kWh'],['sensitivity','가격 민감도','배'],['alpha','이동 비용 α','원/km'],['beta','대기 비용 β','원/분'],['tau','선택 다양성 τ','원']]) {
       const derived = o.forecastPlan && ['drivers','minutes'].includes(key);
+      if (behaviorKeys.includes(key)) {
+        add(label, `${o[key]}${unit}`, literature ? key === 'sensitivity' ? '실험 설정' : '추정값' : '가정값',
+          literature ? key === 'sensitivity' ? '가격계수를 원화 비용 기준 1로 정규화. 한국인 민감도를 추정한 1배가 아님' : '문헌 환산 후보. 위 논문·환산 가정 참조. 같은 네 계수 묶음으로 해석하며 지역·상황 이전 검증 전' : '요구사항 예시 또는 사용자 지정값. 문헌 후보의 한 계수라도 수정하면 네 계수는 사용자 가정 시나리오');
+        continue;
+      }
       if (key === 'energy' && context.energySource === 'jeju' && o.energy === energyDefault(context.speed)) {
         const g = energyProfile.bySpeed[context.speed === 'slow' ? 'slow' : 'fast'];
         add(label, `${o.energy}${unit}`, '추정값', `제주 자료 기반 추정값 · ${context.speed === 'slow' ? '완속' : '급속'} · ${g.start}~${g.end} · ${g.totalKwh}kWh ÷ ${g.sessions}건. ${energyProfile.method} ${energyProfile.unitNote} ${energyProfile.limitation} 출처: ${energyProfile.sourceUrl} · 단위 대조: ${energyProfile.unitReferenceUrl}`);
@@ -403,5 +459,5 @@
     }
     return rows;
   }
-  return { defaults, energyProfile, energyDefault, policies, demo, rng, status, price, probability, validate, population, runPolicy, loadProfile, compare, forecast, forecastV2, poisson, sweep, sweepKeys, evidence };
+  return { defaults, energyProfile, energyDefault, behaviorProfiles, behaviorReference, behaviorKeys, behaviorConversion, behaviorMatch, compareBehavior, policies, demo, rng, status, price, probability, validate, population, runPolicy, loadProfile, compare, forecast, forecastV2, poisson, sweep, sweepKeys, evidence };
 });

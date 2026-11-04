@@ -67,7 +67,7 @@
     const p=result.options.forecastPlan;
     if (!p) return '';
     const time=t=>new Date(t).toLocaleTimeString('ko-KR',{timeZone:'Asia/Seoul',hour:'2-digit',minute:'2-digit'});
-    return `<h4>v2 기준 수요와 구간별 요금</h4><p class="sim-note">실험 시작 ${esc(kst(p.startAt))} · 초기 상태 수집 ${esc(kst(p.observedAt))} · 충전 시작 건수 추정. 현재 적용할 구간만 사용하며 처음 일부 구간은 남은 시간 비례입니다. 원래 A/B 선택지와 포아송 생성 차량을 모든 정책이 공유하고 재선택합니다. kWh·행동계수는 가정값입니다.</p>
+    return `<h4>v2 기준 수요와 구간별 요금</h4><p class="sim-note">실험 시작 ${esc(kst(p.startAt))} · 초기 상태 수집 ${esc(kst(p.observedAt))} · 충전 시작 건수 추정. 현재 적용할 구간만 사용하며 처음 일부 구간은 남은 시간 비례입니다. 원래 A/B 선택지와 포아송 생성 차량을 모든 정책이 공유하고 재선택합니다. 충전량·행동계수는 별도 추정값 또는 사용자 가정입니다.</p>
       <div class="sim-table-wrap"><table class="sim-table"><thead><tr><th>한국 시각</th><th>A 기대 건수</th><th>B 기대 건수</th><th>A / B 이용률 (%)</th>${result.results.map(r=>`<th>${esc(r.label)} A / B 단가</th>`).join('')}</tr></thead><tbody>${p.intervals.map((b,i)=>`<tr><td>${time(b.startAt)}~${time(b.endAt)}${b.partial?' 일부':''}</td><td>${fmt(b.expected[0],3)}</td><td>${fmt(b.expected[1],3)}</td><td>${fmt(b.utilization[0]*100)} / ${fmt(b.utilization[1]*100)}</td>${result.results.map(r=>`<td>${r.priceSchedule[i].prices.map(v=>fmt(v,1)).join(' / ')}</td>`).join('')}</tr>`).join('')}</tbody></table></div>
       <p class="sim-note">요금은 구간 이용률의 정책 판정으로 정하고 차량은 도착 시 선택 단가를 충전 종료까지 적용합니다. 평균 단가는 시간가중 평균입니다. 제공된 충전시간 평균은 참고용이며 에너지·소요시간에 자동 적용하지 않습니다.</p>`;
   }
@@ -91,6 +91,33 @@
   }
   const styles = `body{font:15px/1.7 system-ui,sans-serif;color:#213b31;max-width:1100px;padding:28px;margin:auto}h1{font-size:25px}h3{font-size:20px}p{overflow-wrap:anywhere}.sim-table-wrap{overflow-x:auto}.sim-table{border-collapse:collapse;width:100%;font-size:13px;white-space:nowrap}.sim-table th,.sim-table td{padding:10px;border:1px solid #d7e2db;text-align:right}.sim-table th:first-child{text-align:left}.sim-table caption{text-align:left;padding:12px 0}.sim-table thead{background:#eef5ef}.sim-evidence-table{white-space:normal}.sim-evidence-table td{text-align:left}.sim-note{font-size:12px;color:#53695d}.sim-status{padding:12px;background:#fff0e9}.sim-load-chart{margin:22px 0}.sim-load-chart svg{display:block;width:100%;max-height:300px}.sim-load-legend{display:flex;gap:20px;flex-wrap:wrap}.sim-load-legend span:nth-child(1){color:#536474}.sim-load-legend span:nth-child(2){color:#245d4b}.sim-load-legend span:nth-child(3){color:#a66a17}@media print{body{padding:0;font-size:11px}.sim-load-chart, tr{break-inside:avoid}details{display:block}details>div{display:block!important}.sim-table{font-size:9px;white-space:normal}}`;
   const legendStyles = '.sim-load-legend{margin:10px 0;font-size:12px}.sim-load-legend span{display:inline-flex;align-items:center;gap:6px}.sim-load-key{display:inline-block;flex:0 0 22px;width:22px;border-top:3px solid currentColor}.sim-load-chart figcaption{font-weight:600}';
+  function behaviorRows(output) {
+    const reference = output.profiles[0];
+    return output.profiles.flatMap(profile => profile.results.map((r, i) => [
+      profile.label, r.label, r.share[1] * 100, r.wait,
+      r.load.available ? r.load.combinedPeakKw : null,
+      r.load.available ? r.load.combinedPeakReductionPct : null, r.fee,
+      (r.share[1] - reference.results[i].share[1]) * 100,
+      r.load.available && reference.results[i].load.available ? r.load.combinedPeakKw - reference.results[i].load.combinedPeakKw : null
+    ]));
+  }
+  const behaviorHeaders = ['행동계수 설정','요금 정책','B 선택 (%)','대기 (분)','합산 피크 (kW)','동일 설정의 고정요금 대비 피크 저감 (%)','충전비 (원/명)','기존 계수의 동일 정책 대비 B 변화 (%p)','기존 계수의 동일 정책 대비 피크 차이 (kW)'];
+  function behaviorRender(output) {
+    const c = output.context || {}, p = output.profiles[0].population;
+    return `<p class="sim-note">${esc(c.source || '')} · ${esc(c.region || '')} · 실행 ${esc(kst(c.executedAt || '기록 없음'))}<br>${esc(c.pricingBasis || '')} · ${esc(c.forecastInfo || '')}</p>
+      <p>기존 예시값(s=1, α=600, β=300, τ=2000)과 문헌 환산 후보(s=1, α=950, β=360, τ=7200)를 함께 바꿔 비교했습니다. A/B·예측 구간·차량·도착 시각·초기 잔여시간·선택 난수·요금 정책은 공유합니다. 현재 입력한 사용자 행동계수와의 비교는 아닙니다.</p>
+      <p class="sim-note">반복 ${output.base.repeats}회 · 기대 신규 ${fmt(p.expected,3)}명 · 생성 평균 ${fmt(p.mean,3)}명 (${p.min}~${p.max}) · 0명 반복 ${p.emptyRuns}회. 신규 차량이 적으면 선택 비율과 정책 효과 해석에 주의하세요.</p>
+      <div class="sim-table-wrap"><table class="sim-table"><caption>2개 행동계수 설정 × 3개 요금 정책 · 피크는 15분 평균 부하의 반복별 최대값 평균</caption><thead><tr>${behaviorHeaders.map(h=>`<th scope="col">${esc(h)}</th>`).join('')}</tr></thead><tbody>${behaviorRows(output).map(row=>`<tr>${row.map((v,i)=>i<2?`<th scope="row">${esc(v)}</th>`:`<td>${fmt(v)}</td>`).join('')}</tr>`).join('')}</tbody></table></div>
+      <p class="sim-note">피크 저감률은 각 행동계수 설정 안에서 고정요금과 비교합니다. 오른쪽 두 변화 열은 같은 요금 정책에서 행동계수만 바꾼 차이입니다. 피크 차이가 음수이면 문헌 후보에서 더 낮습니다. 가정 민감도 비교이며 문헌 후보의 정확도나 최적 정책을 입증하지 않습니다.</p>`;
+  }
+  function behaviorHtml(output) {
+    return `<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ESSential 행동계수 비교 리포트</title><style>${styles}${legendStyles}</style></head><body><h1>기존 예시값 · 문헌 환산 후보 비교</h1>${behaviorRender(output)}${output.profiles.map(p=>`<section><h2>${esc(p.label)}</h2>${render(p)}</section>`).join('')}</body></html>`;
+  }
+  function behaviorCSV(output) {
+    return [['비교 구분','기존 예시값과 고정 문헌 환산 후보. 동일 차량·예측 공유. 실측 보정 결과 아님'],
+      ...Object.entries(output.context || {}), behaviorHeaders, ...behaviorRows(output),
+      ...output.profiles.flatMap(p=>[[],['행동계수 상세',p.label],...rows(p)])];
+  }
   function html(result) {
     return `<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ESSential 충전 부하 분석 리포트</title><style>${styles}${legendStyles}</style></head><body><h1>ESSential 요금 정책 분석</h1>${render(result)}</body></html>`;
   }
@@ -114,5 +141,5 @@
     }
     return output;
   }
-  return { render, html, rows };
+  return { render, html, rows, behaviorRender, behaviorHtml, behaviorCSV };
 });
