@@ -59,7 +59,7 @@ test('empirical simulation preserves paired populations, conserves all energy an
   const reverse=await sim.sweep(stations,{...o,durationMode:'power'},'durationMode',['sessions']);
   assert.ok(reverse.scenarios.every(s=>s.results.every(r=>Number.isFinite(r.wait))));
   const behavior=await sim.compareBehavior(stations,o);
-  assert.deepEqual(behavior.profiles[0].results,result.results);
+  assert.deepEqual(behavior.profiles.find(p=>p.id==='literature').results,result.results);
   result.evidence=sim.evidence(stations,result.options,{mode:'real'});
   assert.ok(result.evidence.find(e=>e.item==='완료 세션 출처').basis.includes('a'.repeat(40)));
   assert.match(report.html(result),/초기 잔여시간은 진행 중 시작시각 없이/);

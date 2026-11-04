@@ -2,6 +2,10 @@
 (function(root,factory){if(typeof module==='object'&&module.exports) module.exports=factory();else root.ESSessionTiming=factory();})(typeof globalThis!=='undefined'?globalThis:this,function(){
   'use strict';
   const repo='ev-hackathon/ev-hackathon.github.io', minimum=5, days=30;
+  const residualReference={title:'Durrett (2012), Essentials of Stochastic Processes, 2nd ed.',
+    url:'https://services.math.duke.edu/~rtd/EOSP/EOSP2E.pdf',bookUrl:'https://doi.org/10.1007/978-1-4614-3615-7',
+    section:'§3.3 Age and Residual Life · 저자 공개 제2판 초고 식 (3.10)',
+    limitation:'정상상태 잔여수명 E[T²]/(2E[T])를 유한 표본에 적용. 현재 시작시각 미공개, 시간대별 비정상성·수집 편향·혼합 세션의 한계가 남으며 EV 실측 검증을 대신하지 않음'};
   function timestamp(value){
     const s=String(value||'').trim(), m=/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})$/.exec(s);
     if(!m) return NaN;
@@ -57,6 +61,7 @@
     }
     return {version:'completed-sessions-v1',region,asOf:new Date(asOf).toISOString(),minimum,windowDays:days,
       windowStart:new Date(asOf-days*86400000).toISOString(),source,excluded:c.excluded,rawRows:rows.length,validRows:c.rows.length,pools,stations:selected,
+      residualReference,
       residualMethod:'현재 시작시각 미공개: 긴 세션일수록 관측되기 쉬움을 반영해 총시간에 비례하여 표본을 선택하고 잔여 비율을 균등 추출. 정상상태 가정이며 실측 잔여시간 아님'};
   }
   function adjusted(pool,energy,kw){
@@ -101,5 +106,5 @@
     }
     return {load};
   }
-  return {timestamp,csv,clean,summary,plan,adjusted,sample,residual,createClient};
+  return {timestamp,csv,clean,summary,plan,adjusted,sample,residual,residualReference,createClient};
 });

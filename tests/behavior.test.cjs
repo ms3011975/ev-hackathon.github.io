@@ -3,6 +3,30 @@ const assert=require('node:assert/strict');
 const sim=require('../web/simulation.js');
 const report=require('../web/simulation-report.js');
 
+test('team-adopted fast defaults apply to normal runs and sweeps; slow stays a separate assumption',async()=>{
+  assert.deepEqual(sim.behaviorKeys.map(k=>sim.defaults[k]),[1,950,360,7200]);
+  assert.equal(sim.behaviorDefault('fast').id,'literature');
+  assert.equal(sim.behaviorDefault('slow').id,'legacy');
+  assert.equal(sim.behaviorAdoption.date,'2026-11-05');
+  assert.equal(sim.behaviorAdoption.limitations.length,4);
+  const fast=await sim.compare(sim.demo(),{repeats:2});
+  const explicit=await sim.compare(sim.demo(),{repeats:2,...sim.behaviorProfiles.literature.values});
+  assert.deepEqual(fast.results,explicit.results);
+  const slowStations=sim.demo().map(s=>({...s,speed:'slow',kw:7}));
+  const slow=await sim.compare(slowStations,{repeats:2});
+  assert.deepEqual(sim.behaviorKeys.map(k=>slow.options[k]),[1,600,300,2000]);
+  const sweep=await sim.sweep(slowStations,{repeats:1},'discount',[.1]);
+  assert.equal(sweep.base.alpha,600);
+  const custom=await sim.compare(sim.demo(),{repeats:1,alpha:700});assert.equal(custom.options.alpha,700);
+  const ctx={speed:'fast',behaviorPreset:'literature'};
+  const evidence=sim.evidence(fast.stations,fast.options,ctx);
+  assert.ok(evidence.some(r=>r.item==='행동계수 팀 채택'&&r.value.includes(sim.behaviorAdoption.version)));
+  assert.ok(evidence.some(r=>r.item==='행동계수 적용 한계'&&r.value.includes('대기 발생 가능성')));
+  fast.evidence=evidence;assert.match(report.html(fast),/team-2026-11-05-v1/);
+  const e=sim.evidence(fast.stations,{...fast.options,durationMode:'sessions'},ctx);
+  assert.ok(e.some(r=>r.item==='초기 잔여시간 이론 근거'&&r.basis.includes('EOSP2E.pdf')));
+});
+
 test('literature reference conversion preserves units and fixed rounded preset',()=>{
   const x=sim.behaviorConversion();
   assert.ok(Math.abs(x.tau-7219.628077330819)<1e-8);
