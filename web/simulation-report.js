@@ -27,6 +27,7 @@
     ['도착 기간 종료 시 미완료 신규 차량 (명)', r => r.load.unfinishedAtHorizon],
     ['초기·신규 차량 최종 완료 (시작 후 분)', r => r.load.lastCompletionMinutes],
     ['대표 출력 초과 등가 전력의 신규 차량 (명)', r => r.load.overRatedSessions],
+    ['충전량·출력 상한에 맞춰 시간을 연장한 신규 차량 (명)', r => r.load.extendedSessions || 0],
     ['평균 실제 대기 (분)', r => r.wait],
     ['평균 추가 거리 (km/명)', r => r.distance],
     ['평균 충전비 (원/명)', r => r.fee],
@@ -69,7 +70,7 @@
     const time=t=>new Date(t).toLocaleTimeString('ko-KR',{timeZone:'Asia/Seoul',hour:'2-digit',minute:'2-digit'});
     return `<h4>v2 기준 수요와 구간별 요금</h4><p class="sim-note">실험 시작 ${esc(kst(p.startAt))} · 초기 상태 수집 ${esc(kst(p.observedAt))} · 충전 시작 건수 추정. 현재 적용할 구간만 사용하며 처음 일부 구간은 남은 시간 비례입니다. 원래 A/B 선택지와 포아송 생성 차량을 모든 정책이 공유하고 재선택합니다. 충전량·행동계수는 별도 추정값 또는 사용자 가정입니다.</p>
       <div class="sim-table-wrap"><table class="sim-table"><thead><tr><th>한국 시각</th><th>A 기대 건수</th><th>B 기대 건수</th><th>A / B 이용률 (%)</th>${result.results.map(r=>`<th>${esc(r.label)} A / B 단가</th>`).join('')}</tr></thead><tbody>${p.intervals.map((b,i)=>`<tr><td>${time(b.startAt)}~${time(b.endAt)}${b.partial?' 일부':''}</td><td>${fmt(b.expected[0],3)}</td><td>${fmt(b.expected[1],3)}</td><td>${fmt(b.utilization[0]*100)} / ${fmt(b.utilization[1]*100)}</td>${result.results.map(r=>`<td>${r.priceSchedule[i].prices.map(v=>fmt(v,1)).join(' / ')}</td>`).join('')}</tr>`).join('')}</tbody></table></div>
-      <p class="sim-note">요금은 구간 이용률의 정책 판정으로 정하고 차량은 도착 시 선택 단가를 충전 종료까지 적용합니다. 평균 단가는 시간가중 평균입니다. 제공된 충전시간 평균은 참고용이며 에너지·소요시간에 자동 적용하지 않습니다.</p>`;
+      <p class="sim-note">요금은 구간 이용률의 정책 판정으로 정하고 차량은 도착 시 선택 단가를 충전 종료까지 적용합니다. 평균 단가는 시간가중 평균입니다. v2 제공 평균은 참고용입니다. 완료 기록 모드에서는 별도 원기록의 경험분포를 적용하며 kWh는 별도 추정값을 유지합니다.</p>`;
   }
   function render(result) {
     if (!valid(result)) return `<h3>충전 부하 집중 변화 리포트</h3><p>${esc(result.results.find(r=>!r.load?.available)?.load?.reason || '부하 집계를 사용할 수 없습니다.')}</p>`;
@@ -81,7 +82,8 @@
       <p>${esc(c.source)} · ${esc(c.region)}<br>실행 시각: ${esc(kst(c.executedAt || '기록 없음'))}<br>요금 근거: ${esc(c.pricingBasis)} ${esc(c.forecastInfo)}<br>A: ${esc(result.stations[0].name)} (${esc(result.stations[0].id)}) / B: ${esc(result.stations[1].name)} (${esc(result.stations[1].id)})<br>신규 ${fmt(o.drivers,3)}명${o.forecastPlan?' (기대값)':''} · 도착 ${fmt(o.minutes)}분 · 차량당 ${o.energy}kWh · ${o.repeats}회 · 시드 ${o.seed}</p>
       ${o.forecastPlan ? `<p class="sim-status">생성 평균 ${fmt(result.population.mean,3)}명 · 범위 ${result.population.min}~${result.population.max}명 · 신규 0명 반복 ${result.population.emptyRuns}/${o.repeats}회. 대기시간·비용·거리는 전체 생성 차량을 기준으로 집계합니다. 모든 반복이 0명이라면 선택·대기·비용의 0은 효과 측정값을 의미하지 않습니다.</p>` : ''}
       ${roadNotice(o,c)}${forecastTable(result)}
-      ${overRated ? '<p class="sim-status" data-error="true">충전량과 가정 충전시간으로 계산한 등가 전력이 대표 출력을 넘는 차량이 있습니다. 현재 결과는 에너지 보존 시나리오이며 물리적으로 가능한 부하로 해석할 수 없습니다. 신규 차량 충전시간을 ‘충전량 ÷ 대표 출력’으로 바꾸어 다시 실행하세요.</p>' : '<p class="sim-note">신규 차량은 충전량÷소요시간의 일정 전력, 초기 차량은 대표 출력×가정 잔여시간으로 계산합니다. 실제 충전곡선·효율·출력 공유·비충전 부하는 제외합니다.</p>'}
+      ${o.durationMode==='sessions'?'<p class="sim-status">완료 세션 기록 기반 시간 추정. 초기 잔여시간은 진행 중 시작시각 없이 정상상태 모형으로 추정합니다. 원기록보다 짧게 충전하여 대표 출력을 넘지 않도록 최소시간(충전량÷대표 출력)까지 연장하며, 아래에 연장 차량 수를 표시합니다. 기록에는 비충전 점유가 포함될 수 있습니다. 표본·출처·보정 평균은 ‘입력값과 근거’에서 확인하세요.</p>':''}
+      ${overRated ? '<p class="sim-status" data-error="true">충전량과 가정 충전시간으로 계산한 등가 전력이 대표 출력을 넘는 차량이 있습니다. 현재 결과는 에너지 보존 시나리오이며 물리적으로 가능한 부하로 해석할 수 없습니다. 신규 차량 충전시간을 ‘충전량 ÷ 대표 출력’으로 바꾸어 다시 실행하세요.</p>' : '<p class="sim-note">신규 차량은 충전량÷소요시간의 일정 전력, 초기 차량은 완료 기록 모드에서 (충전량÷보정 총시간)×추정 잔여시간, 그 외에는 대표 출력×가정 잔여시간으로 계산합니다. 실제 충전곡선·효율·출력 공유·비충전 부하는 제외합니다.</p>'}
       <div class="sim-table-wrap"><table class="sim-table"><caption>각 반복에서 지표를 계산한 뒤 평균 · 피크 저감률은 양수=감소, 음수=증가</caption><thead><tr><th>지표</th>${results.map(r=>`<th>${esc(r.label)}</th>`).join('')}</tr></thead><tbody>${metrics.map(([label,get])=>`<tr><th scope="row">${label}</th>${results.map(r=>`<td>${fmt(get(r))}</td>`).join('')}</tr>`).join('')}</tbody></table></div>
       <div class="sim-report-findings">${results.slice(1).map(r=>`<p><strong>${esc(r.label)}</strong>: 고정요금 대비 A 피크 저감률 ${pct(r.load.stationPeakReductionPct[0])}, B ${pct(r.load.stationPeakReductionPct[1])}, 합산 ${pct(r.load.combinedPeakReductionPct)}. 합산 피크 차이는 ${fmt(r.load.combinedPeakDeltaKw)}kW이고, 평균 대기 차이는 ${fmt(r.wait-results[0].wait)}분입니다.</p>`).join('')}</div>
       <p class="sim-note">A의 피크가 줄어도 B 또는 합산 피크는 증가할 수 있습니다. 합산 피크는 같은 시각의 A+B 곡선에서 계산하며 A 피크+B 피크를 더하지 않습니다. SE는 반복 난수에 따른 표준오차이며 모델·행동 가정·미래 예측의 불확실성을 포함하지 않습니다.</p>

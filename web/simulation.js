@@ -4,6 +4,7 @@
   else root.ESSimulation = factory();
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
   'use strict';
+  const timing = typeof module === 'object' && module.exports ? require('./session-timing.js') : globalThis.ESSessionTiming;
   const energyProfile = typeof module === 'object' && module.exports ? require('../data/jeju_energy_summary.json') : /*__JEJU_ENERGY__*/null;
   const energyDefault = speed => energyProfile.bySpeed[speed === 'slow' ? 'slow' : 'fast'].defaultKwh;
   const behaviorKeys = ['sensitivity', 'alpha', 'beta', 'tau'];
@@ -171,7 +172,17 @@
       if (!Number.isFinite(o[key]) || o[key] < lo || o[key] > hi || (integer && !Number.isInteger(o[key])))
         throw new Error(`${key}: ${lo}~${hi}${integer ? ' 정수' : ''} 값을 입력하세요.`);
     }
-    if (!['assumed', 'power'].includes(o.durationMode)) throw new Error('충전시간 계산 방식을 확인하세요.');
+    if (!['assumed', 'power', 'sessions'].includes(o.durationMode)) throw new Error('충전시간 계산 방식을 확인하세요.');
+    if (o.durationMode === 'sessions') {
+      const p = o.sessionPlan;
+      if (p?.version !== 'completed-sessions-v1' || p.stations?.length !== stations.length || p.stations.some((s,i)=>s.id!==stations[i].id || s.speed!==stations[i].speed || !p.pools?.[s.pool]))
+        throw new Error('선택 충전소의 완료 세션 자료를 먼저 불러오세요.');
+      for (const s of p.stations) {
+        const pool=p.pools[s.pool];
+        if (!['station','region','power'].includes(pool.level) || !Array.isArray(pool.values) || pool.values.some(v=>!Number.isFinite(v)||v<1||v>1440) ||
+            (pool.level==='power' ? pool.values.length!==0 : pool.values.length<5)) throw new Error('완료 세션 표본·대체 기준을 확인하세요.');
+      }
+    }
     if (o.roadDistances !== undefined && (!Array.isArray(o.roadDistances) || o.roadDistances.length!==2 || o.roadDistances.some(v=>!Number.isFinite(v)||v<0||v>200)))
       throw new Error('A→B / B→A 도로 거리를 확인하세요 (각 0~200km).');
     if (stations.length !== 2 || stations[0].id === stations[1].id || stations[0].speed !== stations[1].speed)
@@ -194,20 +205,27 @@
         for (let n=0;n<count;n++) drivers.push({id:drivers.length,origin,arrival:bin.start+random()*(bin.end-bin.start),duration:20+random()*20,choice:random()});
       }
       drivers.sort((a,b)=>a.arrival-b.arrival||a.id-b.id);
-      return { initial, drivers };
+      return { initial, drivers, initialDuration: stations.map(s=>Array.from({length:s.charging},()=>random())) };
     }
     const drivers = Array.from({ length: o.drivers }, (_, id) => ({ id, arrival: random() * o.minutes, duration: 20 + random() * 20, choice: random() }))
       .sort((a, b) => a.arrival - b.arrival || a.id - b.id);
-    return { initial, drivers };
+    return { initial, drivers, initialDuration: stations.map(s=>Array.from({length:s.charging},()=>random())) };
   }
-  const duration = (s, o, assumed) => o.durationMode === 'power' ? o.energy / s.kw * 60 : assumed;
+  function duration(s, o, assumed) {
+    if (o.durationMode==='assumed') return assumed;
+    const floor=o.energy/s.kw*60;
+    if (o.durationMode!=='sessions') return floor;
+    const entry=o.sessionPlan.stations.find(e=>e.id===s.id&&e.speed===s.speed), pool=o.sessionPlan.pools[entry.pool];
+    return pool.values.length ? Math.max(floor,timing.sample(pool,(assumed-20)/20)) : floor;
+  }
   const diversionDistance = (origin, destination, o) => origin === destination ? 0 : o.roadDistances?.[origin] ?? o.distance;
   // Energy-conserving constant equivalent power, not measured grid demand.
-  // Initial sessions use representative output because their remaining energy is unknown.
+  // Empirical initial sessions use energy / adjusted total duration; legacy modes use rated output.
   function loadProfile(stations, o, initial, records) {
     const intervalMinutes = 15, events = [];
-    initial.forEach((remaining, station) => remaining.forEach(end => {
-      if (end > 0) events.push({ station, start: 0, end, kw: stations[station].kw, initial: true });
+    initial.forEach((remaining, station) => remaining.forEach(item => {
+      const end=typeof item==='number'?item:item.remaining, kw=typeof item==='number'?stations[station].kw:item.kw;
+      if (end > 0) events.push({ station, start: 0, end, kw, initial: true });
     }));
     let overRatedSessions = 0;
     for (const r of records) {
@@ -256,7 +274,8 @@
       stationEnergyKwh, initialEnergyKwh, newEnergyKwh: records.length * o.energy,
       tailEnergyKwh, unfinishedAtHorizon: records.filter(r => r.end > o.minutes).length,
       windowUtilization, utilizationGapPp: windowUtilization.every(v => v !== null) ? Math.abs(windowUtilization[0] - windowUtilization[1]) * 100 : null,
-      overRatedSessions, lastCompletionMinutes };
+      overRatedSessions, lastCompletionMinutes,
+      extendedSessions: records.filter(r=>r.durationExtended).length };
   }
   function runPolicy(stations, o, people, policy, utilizationById) {
     const priceSchedule = o.forecastPlan?.intervals.map(bin=> {
@@ -264,10 +283,12 @@
       return {start:bin.start,end:bin.end,prices:stations.map(s=>price(s,policy,o,u))};
     });
     const prices = priceSchedule ? stations.map((s,i)=>priceSchedule.reduce((n,b)=>n+b.prices[i]*(b.end-b.start),0)/o.minutes) : stations.map(s => price(s, policy, o, utilizationById));
-    const queues = stations.map((s, i) => [
-      ...Array(s.avail).fill(0), ...people.initial[i].map(u => u * duration(s, o, 30))
-    ]);
-    const initial = queues.map(q => q.filter(t => t > 0));
+    const initial = stations.map((s,i)=>{
+      if (o.durationMode!=='sessions') return people.initial[i].map(u=>u*duration(s,o,30));
+      const pool=o.sessionPlan.pools[o.sessionPlan.stations[i].pool], adjusted=timing.adjusted(pool,o.energy,s.kw);
+      return people.initial[i].map((u,j)=>timing.residual(adjusted,people.initialDuration[i][j],u,o.energy));
+    });
+    const queues = stations.map((s, i) => [...Array(s.avail).fill(0),...initial[i].map(v=>typeof v==='number'?v:v.remaining)]);
     const records = [], count = [0, 0];
     let wait = 0, estimated = 0, charge = 0, distance = 0, discount = 0, completion = 0;
     for (const d of people.drivers) {
@@ -285,7 +306,10 @@
       q[slot] = end; count[i]++; wait += actual; estimated += expected[i];
       charge += o.energy * quote[i]; distance += diversionDistance(origin,i,o);
       discount += o.energy * Math.max(0, stations[i].base - quote[i]); completion = Math.max(completion, end);
-      records.push({ driver: d.id, origin, station: i, price:quote[i], extraDistance:diversionDistance(origin,i,o), arrival: d.arrival, expectedWait: expected[i], actualWait: actual, start, end });
+      let observedDuration=null;
+      if (o.durationMode==='sessions') { const pool=o.sessionPlan.pools[o.sessionPlan.stations[i].pool]; if(pool.values.length) observedDuration=timing.sample(pool,(d.duration-20)/20); }
+      records.push({ driver: d.id, origin, station: i, price:quote[i], extraDistance:diversionDistance(origin,i,o), arrival: d.arrival, expectedWait: expected[i], actualWait: actual, start, end,
+        observedDuration, durationExtended: observedDuration!==null && observedDuration < o.energy/stations[i].kw*60 });
     }
     const n = people.drivers.length, denominator = n || 1;
     return { policy, prices, priceSchedule, drivers:n, count, share: count.map(v => v / denominator), wait: wait / denominator,
@@ -314,8 +338,8 @@
           if (!out.load) out.load = { available: true, intervalMinutes: l.intervalMinutes, capacityKw: l.capacityKw,
             stationPeakKw: [0, 0], stationEnergyKwh: [0, 0], windowUtilization: l.windowUtilization.map(v => v === null ? null : 0),
             combinedPeakKw: 0, initialEnergyKwh: 0, newEnergyKwh: 0, tailEnergyKwh: 0, unfinishedAtHorizon: 0,
-            overRatedSessions: 0, lastCompletionMinutes: 0, utilizationGapPp: l.utilizationGapPp === null ? null : 0, series: [] };
-          for (const key of ['combinedPeakKw','initialEnergyKwh','newEnergyKwh','tailEnergyKwh','unfinishedAtHorizon','overRatedSessions','lastCompletionMinutes']) out.load[key] += l[key] / o.repeats;
+            overRatedSessions: 0, extendedSessions: 0, lastCompletionMinutes: 0, utilizationGapPp: l.utilizationGapPp === null ? null : 0, series: [] };
+          for (const key of ['combinedPeakKw','initialEnergyKwh','newEnergyKwh','tailEnergyKwh','unfinishedAtHorizon','overRatedSessions','extendedSessions','lastCompletionMinutes']) out.load[key] += l[key] / o.repeats;
           if (l.utilizationGapPp !== null) out.load.utilizationGapPp += l.utilizationGapPp / o.repeats;
           for (let i = 0; i < 2; i++) {
             out.load.stationPeakKw[i] += l.stationPeakKw[i] / o.repeats;
@@ -391,14 +415,14 @@
       const people = population(stations, base, random), extraRandom = rng((base.seed ^ Math.imul(r + 1, 0x9e3779b1)) >>> 0);
       const drivers = people.drivers.map(d => ({ ...d }));
       if (!base.forecastPlan) for (let id = base.drivers; id < maxDrivers; id++) drivers.push({ id, arrival: extraRandom() * base.minutes, duration: 20 + extraRandom() * 20, choice: extraRandom() });
-      bank.push({ initial: people.initial, drivers });
+      bank.push({ initial: people.initial, initialDuration:people.initialDuration, drivers });
     }
     const scenarios = [];
     for (let i = 0; i < levels.length; i++) {
       if (cancelled()) throw new Error('분석을 중단했습니다.');
       const value = levels[i], o = { ...base, [key]: value };
       if (key === 'distance' && value !== base.distance) delete o.roadDistances;
-      const populations = bank.map(p => ({ initial: p.initial, drivers: p.drivers.filter(d => base.forecastPlan || d.id < o.drivers)
+      const populations = bank.map(p => ({ initial: p.initial, initialDuration:p.initialDuration, drivers: p.drivers.filter(d => base.forecastPlan || d.id < o.drivers)
         .map(d => ({ ...d, arrival: o.minutes === base.minutes ? d.arrival : d.arrival / base.minutes * o.minutes })).sort((a, b) => a.arrival - b.arrival || a.id - b.id) }));
       const output = await compare(stations, o, p => onProgress((i + p) / levels.length), utilizationById, { populations, cancelled });
       scenarios.push({ value, ...output });
@@ -450,8 +474,21 @@
         `${context.roadRoute?.provider || 'OSRM car'} · 조회 ${context.roadRoute?.fetchedAt || '기록 없음'} · ${context.roadRoute?.url || ''}. OSM 도로 연결점 기준 최단시간 경로 거리. 실시간 교통·GPS 실측 아님. 도로 연결 오차 ${JSON.stringify(context.roadRoute?.snapMeters || [])}m. 원래 선택지에서는 0km, 변경 방향에 맞는 거리를 적용. 이동시간은 도착 시각에 더하지 않음. 차량 출발지·최종 목적지가 없어 실제 우회거리로 대체하는 가정이 남음.`);
     } else if (context.distanceMode === 'road') add('대체 충전소 도로 거리','조회 필요','미입력','도로 거리 조회가 완료되어야 실행할 수 있음. 직선거리로 자동 대체하지 않음');
     else add(o.forecastPlan ? '대체 충전소 추가 거리' : 'B 추가 거리', `${o.distance}km`, context.distanceMode === 'coords' ? '추정값' : '가정값', (context.distanceMode === 'coords' ? 'A/B 좌표의 직선거리. 도로 거리·이동시간 아님' : '사용자 지정 추가 거리. 양방향 동일 가정.') + (o.forecastPlan ? ' 원래 A/B 선택지에서는 0km, 다른 곳으로 바꾸면 추가 거리 적용' : ' A는 0km 가정'));
-    add('신규 충전시간', o.durationMode === 'power' ? '충전량 ÷ 대표 출력 × 60분' : '20~40분 균등분포', '가정값', '간소화 모델. 충전효율·충전곡선·출력 공유 제외');
-    add('초기 잔여 충전시간', o.durationMode === 'power' ? '0~(충전량 ÷ 대표 출력 × 60)분 균등분포' : '0~30분 균등분포', '가정값', '초기 차량의 실제 잔여시간은 관측하지 않음');
+    if (o.durationMode==='sessions') {
+      const p=o.sessionPlan;
+      add('신규 충전시간','최근 완료 세션의 경험분포에서 추출',p?'추정값':'미입력','급속·완속 구분. 선택 충전소 5건 이상 → 같은 지역·종류 5건 이상 → 충전량÷대표 출력 순서. 짧은 표본은 충전량÷대표 출력까지 연장해 에너지·출력 상한을 함께 보존');
+      add('초기 잔여 충전시간','총시간 길이 비례 표본 + 0~총시간 잔여 비율',p?'추정값':'미입력','현재 진행 중 세션의 시작시각은 공개 자료에 없음. 긴 세션이 점유 상태로 관측될 확률이 높은 정상상태를 가정. 실제 잔여시간 아님. 세션별 일정 등가 전력=별도 충전량÷보정 총시간');
+      if(p) {
+        add('완료 세션 출처',p.source.repository,'실측·수집값',`고정 버전 ${p.source.commit} · 분석 기준 ${p.asOf} · 종료 시각 기준 최근 ${p.windowDays}일 (${p.windowStart}~${p.asOf}) · 파일 ${JSON.stringify(p.source.files)}`);
+        add('완료 세션 정제',`${p.rawRows}행 → 유효 ${p.validRows}건`,'실험 설정',`1~1440분, 시작·종료 시각 및 minutes 일치 검사. 미래·기간 외, 중복, 동일 시작의 종료 충돌 제외: ${JSON.stringify(p.excluded)}. 수집 초기·기기별 보고 차이로 표본이 불균등할 수 있음. 5건은 최소 처리 규칙이며 통계적 신뢰성을 보장하지 않음. 지역 대체는 장소·출력·차종 구성이 다를 수 있음. 기록은 비충전 점유를 포함할 수 있음`);
+        p.stations.forEach((entry,i)=>{const pool=p.pools[entry.pool],s=stations[i],a=timing.adjusted(pool,o.energy,s.kw),f=n=>Number(n).toFixed(2);
+          add(`${i?'B':'A'} 적용 충전시간`,pool.values.length?`${pool.level==='station'?'해당 충전소':'같은 지역·종류'} ${pool.values.length}건 · 평균 ${f(pool.mean)} / P10 ${f(pool.p10)} / 중앙 ${f(pool.p50)} / P90 ${f(pool.p90)}분`:'표본 부족 → 충전량÷대표 출력',pool.values.length?'추정값':'가정값',`충전소 ${entry.stationN}건 / 지역 ${entry.regionN}건. 실제 종료 기록 범위 ${pool.firstEnd||'없음'}~${pool.lastEnd||'없음'}. 적용 신규 평균 ${f(a.mean)}분, 초기 잔여 기대 ${f(a.meanRemaining)}분. 최소 ${f(a.minMinutes)}분으로 연장되는 원표본 ${a.clipped}건. 초기 차량도 별도 충전량 ${o.energy}kWh를 총 세션량으로 가정하며 시간으로 kWh를 역산하지 않음`);
+        });
+      }
+    } else {
+      add('신규 충전시간', o.durationMode === 'power' ? '충전량 ÷ 대표 출력 × 60분' : '20~40분 균등분포', '가정값', '간소화 모델. 충전효율·충전곡선·출력 공유 제외');
+      add('초기 잔여 충전시간', o.durationMode === 'power' ? '0~(충전량 ÷ 대표 출력 × 60)분 균등분포' : '0~30분 균등분포', '가정값', '초기 차량의 실제 잔여시간은 관측하지 않음');
+    }
     add('도착·선택 모형', o.forecastPlan ? '구간·원래 선택지별 포아송 건수 + 구간 내 균등 도착 · 로짓 재선택' : '기간 내 균등 도착 · 로짓 선택', '가정값', '취소·포기·추가 이동시간 제외. 행동모델 실측 보정 전');
     add('반복·난수', `${o.repeats}회 · 시드 ${o.seed}`, '실험 설정', '재현성과 반복 변동 확인용. 반복 횟수는 실세계 정확도를 보장하지 않음');
     add('요금 판정 근거', context.pricingBasis || '현재 수집 상태', context.forecastInfo ? '추정값' : context.forecastRequested ? '미입력' : real ? '실측·수집값' : '가정값', context.forecastInfo ? `${context.forecastInfo} · 외부 예측. 정확도·학습자료는 이 사이트에서 검증하지 않음` : context.forecastRequested ? '예측 JSON이 없거나 아직 검증되지 않았습니다. 실행 시 검증합니다.' : '시작 시 상태에 정책을 적용하고 단가 고정');
@@ -463,7 +500,7 @@
       add('실험 시작·초기 상태 시각', `${p.startAt} / 수집 ${p.observedAt}`, '실험 설정', '실행 시점부터 남은 구간만 사용. 과거 구간 제외, 일부 구간의 건수는 남은 시간 비율로 조정. 수집 후 상태는 유지한다고 가정');
       add('v2 건수 방법', JSON.stringify(p.method), '추정값', '모델 제공 방법 설명. 이용률·충전시간 기반 시작 건수 추정이며 가격 반응을 학습한 모델은 아님');
       add('v2 시작 건수 검증', JSON.stringify(p.validation), '추정값', '제공 모델의 검증 참고. 초기 세션 기록에 따른 제한이 있으며 실측 도착 수 검증이 아님');
-      (p.stationStats || []).forEach((s,i)=>{if(s) add(`${i?'B':'A'} 충전시간 통계 참고`, `${s.mean_duration_minutes}분 · ${s.duration_level}`, '추정값', '모델 제공 충북 세션 통계/지역 대체 평균. kWh를 알 수 없어 충전시간·에너지에 자동 적용하지 않음');});
+      (p.stationStats || []).forEach((s,i)=>{if(s) add(`${i?'B':'A'} v2 충전시간 통계 참고`, `${s.mean_duration_minutes}분 · ${s.duration_level}`, '추정값', 'v2 제공 요약은 참고용. 완료 세션 모드는 별도로 불러온 원기록의 경험분포를 사용. kWh는 시간으로 역산하지 않음');});
     }
     return rows;
   }

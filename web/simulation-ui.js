@@ -3,6 +3,8 @@
   const sim = window.ESSimulation, config = JSON.parse(document.getElementById('sim-config').textContent);
   const routing = window.ESSRouting, roadClient = routing.createClient((url, opts)=>fetch(url, opts));
   let roadState = null, roadTimer;
+  const timingClient=window.ESSessionTiming.createClient((url,opts)=>fetch(url,opts));
+  let sessionState=null;
   const $ = id => document.getElementById(id), escape = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
   const fmt = (n, d = 1) => Number.isFinite(n) ? n.toLocaleString('ko-KR', { minimumFractionDigits: d, maximumFractionDigits: d }) : '—';
   const kst = value => Number.isFinite(Date.parse(value)) ? new Date(value).toLocaleString('ko-KR',{timeZone:'Asia/Seoul',hourCycle:'h23'})+' (한국 시각)' : String(value ?? '');
@@ -40,7 +42,9 @@
         <label class="sim-wide">추가 거리 산정<select id="sim-distanceMode"><option value="road">자동차 도로 이동거리 · 방향별 자동 조회</option><option value="manual">사용자 입력 거리 · 양방향 동일 가정</option></select></label>
         <p id="sim-road-status" class="sim-note sim-wide" role="status"></p>
         <button type="button" class="sim-wide" id="sim-road-reload">도로 거리 다시 조회</button>
-        <label class="sim-wide">신규 차량 충전시간 ${badge('가정값')}<select id="sim-durationMode"><option value="power"${sim.defaults.durationMode === 'power' ? ' selected' : ''}>충전량 ÷ 대표 출력 × 60분 (기본)</option><option value="assumed"${sim.defaults.durationMode === 'assumed' ? ' selected' : ''}>20~40분 균등분포 (간소화 가정)</option></select></label>
+        <label class="sim-wide">신규·초기 차량 충전시간 <span id="sim-kind-duration">${badge('추정값')}</span><select id="sim-durationMode"><option value="sessions" selected>충전 시작·종료 기록 기반 추정 (실제 데이터 기본)</option><option value="power">충전량 ÷ 대표 출력 × 60분</option><option value="assumed">20~40분 균등분포 (간소화 가정)</option></select></label>
+        <p class="sim-wide sim-note" id="sim-timing-status" role="status">실행 시 최근 완료 세션을 자동으로 불러옵니다.</p>
+        <button type="button" class="sim-wide" id="sim-timing-load">충전시간 기록 불러오기</button>
         <label class="sim-wide">요금·수요 기준<select id="sim-pricingBasis"><option value="observed">현재 수집 상태 + 수동 수요</option><option value="forecast">AI 1시간 후 이용률 + 수동 수요 (v1)</option><option value="forecast-v2">AI 15분 구간 이용률·신규 건수 (v2)</option></select></label>
       </div>
       <div id="sim-forecast-panel" hidden>
@@ -90,13 +94,14 @@
           <button id="sim-sweep-run" type="button" class="sim-primary">민감도 분석 실행</button>
         </fieldset>
         <button id="sim-sweep-cancel" type="button" hidden>분석 중단</button>
-        <p class="sim-note">비교값은 최대 8개입니다. 정책 비율은 화면과 동일한 % 단위입니다. 거리 변경은 사용자 가정 시나리오로 취급합니다. 충전시간 방식은 assumed(20~40분), power(출력 기반)를 사용합니다. 제안값은 검증된 현실 범위가 아닙니다.</p>
+        <p class="sim-note">비교값은 최대 8개입니다. 정책 비율은 화면과 동일한 % 단위입니다. 거리 변경은 사용자 가정 시나리오로 취급합니다. 충전시간 방식은 sessions(완료 기록), power(출력 기반), assumed(20~40분)입니다. 제안값은 검증된 현실 범위가 아닙니다.</p>
         <p id="sim-sweep-status" class="sim-status" role="status" aria-live="polite">항목과 비교값을 확인한 뒤 실행하세요.</p>
         <div id="sim-sweep-results"></div>
       </section>
       <details class="sim-card"><summary>모델 가정과 결과 읽는 방법</summary>
         <p>수동 수요는 기간 내 균등 도착이며 A를 원래 목적지로 둡니다. v2는 충전소·구간별 기대 충전 시작 건수를 평균으로 하는 독립 포아송 건수와 구간 내 균등 도착을 가정합니다. 원래 선택지는 A/B별로 보존하고 다른 충전소로 바꿀 때만 추가 거리를 적용합니다. 이동 소요시간은 따로 더하지 않습니다.</p>
-        <p>기본 충전시간은 충전량÷대표 출력×60분이며 초기 차량 잔여시간은 0~해당 시간의 균등분포입니다. 선택 가능한 20~40분 가정 모드에서는 초기 잔여시간을 0~30분으로 둡니다. 충전효율·배터리 충전곡선·출력 공유는 반영하지 않습니다. 혼합 출력 충전소는 기존 관제의 대표 출력·단가를 동일하게 적용합니다.</p>
+        <p>실제 데이터의 기본 시간은 최근 30일 완료 세션 기록에서 추출합니다. 같은 충전소·종류 5건 이상, 부족하면 같은 지역·종류 5건 이상을 사용하며 모두 부족하면 출력 기반으로 대체합니다. 현재 진행 중 세션의 시작시각은 공개되지 않아 초기 잔여시간은 총시간 길이 비례 표본과 균등 잔여 비율로 추정합니다(정상상태 가정). 수집 초기에는 실제 표본 기간이 짧습니다. 기록에는 비충전 점유가 포함될 수 있습니다.</p>
+        <p>kWh는 기록에 없어 별도 제주 추정값/사용자 가정을 유지합니다. 기록 시간이 충전량÷대표 출력×60분보다 짧으면 그 최소시간까지 연장하고 표본 수와 결과의 연장 차량 수를 표시합니다. 신규·초기 차량의 등가 전력은 충전량÷보정 총시간으로 계산합니다. 출력 기반 모드의 초기 잔여는 0~총시간, 20~40분 모드의 초기 잔여는 0~30분 균등분포입니다. 충전곡선·효율·출력 공유는 제외합니다.</p>
         <p>판정 분모는 빈 충전기+충전 중이며 고장·미확인 충전기는 처리 능력에서 제외합니다. 수동/v1 요금은 고정하고 v2는 각 도착 구간의 예측 이용률로 요금을 정합니다. 요금표는 시간가중 평균 단가이며 차량은 선택 시 단가를 충전 종료까지 적용합니다. 초기 점유는 수집 상태이며 미래 대기열을 복원하지 않습니다.</p>
         <p>선택 당시 예상 대기는 이미 도착한 차량을 포함한 가장 빠른 충전기 사용 가능 시각으로 계산합니다. 실제 대기는 도착순 FIFO 예약 후 계산합니다. 같은 정보와 변경 없는 대기열을 사용하는 이 모델에서는 두 값이 일치합니다. 기간 내 도착한 모든 신규 차량을 충전 완료까지 집계하며 초기 차량의 요금은 제외합니다.</p>
         <p>결과는 반복 1회당 평균입니다. 평균 대기의 표준오차(SE)는 반복 실험 간 변동이며 실세계 예측 오차가 아닙니다. 총 할인 혜택은 기본 단가 대비 할인액의 합으로 사업자 순손실과 다릅니다. 수입 차이는 정책별 선택 충전소와 단가로 계산한 단순 매출 차이이며 비용을 반영하지 않습니다.</p>
@@ -135,7 +140,39 @@
   }
   $('sim-behavior-reference-content').innerHTML = behaviorReferenceHTML();
   function selected() { return [$('sim-a').value, $('sim-b').value].map(id => pool.find(s => s.id === id)); }
+  function timingKey() { return [$('sim-mode').value,$('sim-region').value,sourceWhen,...selected().map(s=>s?.id+':'+s?.speed)].join('|'); }
+  function showTiming() {
+    const active=$('sim-durationMode').value==='sessions',ready=sessionState?.key===timingKey();
+    const hasFallback=ready && sessionState.plan.stations.some(s=>sessionState.plan.pools[s.pool].level==='power');
+    $('sim-kind-duration').innerHTML=badge(active?(hasFallback?'추정·가정 혼합':'추정값'):'가정값');
+    $('sim-timing-load').disabled=busy || $('sim-mode').value!=='real';
+    if(!active) { $('sim-timing-status').textContent='선택한 가정 시간 모드를 사용합니다. 완료 기록 모드로 바꾸면 신규·초기 차량에 함께 적용합니다.';return; }
+    if(!ready) { $('sim-timing-status').textContent='실행 시 완료 기록 자동 조회 · 최근 30일, 충전소 5건 → 같은 지역·종류 5건 → 출력 기반 대체. 초기 잔여시간은 정상상태 추정이며 실측값이 아닙니다.';return; }
+    const p=sessionState.plan;
+    $('sim-timing-status').innerHTML=p.stations.map((s,i)=>{
+      const pool=p.pools[s.pool],a=window.ESSessionTiming.adjusted(pool,+$('sim-energy').value,selected()[i].kw);
+      return `<strong>${i?'B':'A'}</strong> · ${pool.level==='station'?'해당 충전소':pool.level==='region'?'지역·같은 종류로 대체':'표본 부족 → 출력 기반 가정'} ${pool.values.length}건<br>기록 평균 ${fmt(pool.mean)}분 → 적용 신규 평균 ${fmt(a.mean)}분 / 초기 잔여 기대 ${fmt(a.meanRemaining)}분<br>충전소 ${s.stationN}건 · 지역 ${s.regionN}건 · 최소 ${fmt(a.minMinutes)}분으로 연장하는 원표본 ${a.clipped}건`;
+    }).join('<br><br>')+`<br><br>초기 잔여는 정상상태 추정이며 실측값이 아닙니다. 긴 세션이 점유 중 관측되기 쉬워 잔여 기대가 신규 평균보다 길 수도 있습니다. 기준 ${escape(kst(p.asOf))}. <a href="${escape(p.source.repository)}" target="_blank" rel="noopener">원기록·고정 버전</a>. 분위수·정제·출처는 ‘입력값의 근거’에서 확인하세요.`;
+  }
+  async function ensureTiming(required=$('sim-durationMode').value==='sessions') {
+    if(!required) return;
+    if($('sim-mode').value!=='real') throw new Error('완료 기록 모드는 실제 공공데이터에서 사용하세요.');
+    const key=timingKey(),stations=selected().map(s=>({...s}));
+    const text=String(sourceWhen).replace(' ','T'),asOf=Date.parse(/(Z|[+-]\d\d:\d\d)$/.test(text)?text:text+'+09:00');
+    if(!Number.isFinite(asOf)) throw new Error('완료 기록의 기준으로 사용할 초기 상태 수집 시각이 없습니다. 실제 데이터를 다시 읽으세요.');
+    $('sim-timing-status').textContent='최근 완료 세션을 읽고 중복·비정상 기록을 정제하는 중입니다…';
+    try {
+      const plan=await timingClient.load(stations,$('sim-region').value,asOf);
+      if(key!==timingKey()) throw new Error('조회 중 조건이 변경됐습니다. 다시 불러오세요.');
+      sessionState={key,plan};showTiming();renderEvidence();
+    } catch(e) {
+      sessionState=null;
+      $('sim-timing-status').textContent=`충전시간 기록 조회 실패: ${e.message} 다시 시도하거나 출력 기반 모드를 직접 선택하세요.`;
+      throw e;
+    }
+  }
   function invalidate() {
+    showTiming();
     if (last) $('sim-export').disabled = true;
     for (const id of ['sim-report-export','sim-load-export']) $(id).disabled = true;
     if (last) $('sim-load-state').textContent = '조건이 변경되었습니다. 이전 실행 리포트입니다. 다시 실행하세요.';
@@ -203,6 +240,7 @@
   }
   function cards() {
     updateBehavior();
+    showTiming();
     distance(); $('sim-source').textContent = source;
     $('sim-stations').innerHTML = selected().map((s, i) => !s ? '<p>선택할 충전소가 없습니다.</p>' : `<div class="sim-station"><strong>${i ? 'B' : 'A'} · ${escape(s.name)}</strong>${badge($('sim-mode').value === 'real' ? '실측·수집값' : '가정값')}
       <div class="sim-note">ID ${escape(s.id)} · ${s.speed === 'fast' ? '급속' : '완속'}<br>${fmt(s.lat, 5)}, ${fmt(s.lng, 5)}<br>
@@ -230,6 +268,8 @@
     $('sim-run').disabled = true; $('sim-reload').disabled = true;
     try {
       const demo = $('sim-mode').value === 'demo', speed = $('sim-speed').value;
+      $('sim-durationMode').querySelector('option[value="sessions"]').disabled=demo;
+      if(demo && $('sim-durationMode').value==='sessions') $('sim-durationMode').value='power';
       $('sim-region').disabled = demo;
       if (demo) {
         source = '예시 데이터 · 실제 충전소가 아닙니다';
@@ -261,6 +301,7 @@
     const o = Object.fromEntries(fields.map(([key]) => [key, +$('sim-' + key).value]));
     for (const k of ['discount', 'surcharge', 'threshold']) o[k] /= 100;
     o.durationMode = $('sim-durationMode').value;
+    if(sessionState?.key===timingKey()) o.sessionPlan=sessionState.plan;
     if ($('sim-distanceMode').value==='road') {
       try {if (roadState?.status==='ready' && roadState.key===routing.key(selected())) o.roadDistances=[...roadState.result.roadDistances];} catch { /* incomplete pair shown as missing */ }
     }
@@ -291,6 +332,7 @@
     $('sim-run').disabled = active || pool.length < 2; $('sim-reload').disabled = active;
     $('sim-connect').disabled = active;
     $('sim-road-reload').disabled = active || $('sim-distanceMode').value!=='road';
+    $('sim-timing-load').disabled = active || $('sim-mode').value!=='real';
     $('sim-behavior-run').disabled = active || $('sim-speed').value !== 'fast' || pool.length < 2;
     if (!active) $('sim-region').disabled = $('sim-mode').value === 'demo';
   }
@@ -353,11 +395,11 @@
     downloadFile('essential-forecast-format-example.json', JSON.stringify(payload,null,2), 'application/json;charset=utf-8');
   });
   const sweepLabel = key => key === 'durationMode' ? '충전시간 계산 방식' : fields.find(f => f[0] === key)[1];
-  const levelLabel = (key, value) => key === 'durationMode' ? value === 'power' ? '출력 기반' : '20~40분 가정' : fmt(policiesFields.has(key) ? value * 100 : value, 3).replace(/\.?0+$/, '');
+  const levelLabel = (key, value) => key === 'durationMode' ? value === 'sessions' ? '완료 기록 기반' : value === 'power' ? '출력 기반' : '20~40분 가정' : fmt(policiesFields.has(key) ? value * 100 : value, 3).replace(/\.?0+$/, '');
   function presetSweep() {
     invalidateSweep();
     const key = $('sim-sweep-key').value;
-    if (key === 'durationMode') { $('sim-sweep-values').value = 'assumed,power'; return; }
+    if (key === 'durationMode') { $('sim-sweep-values').value = $('sim-mode').value==='real' ? 'sessions,power' : 'assumed,power'; return; }
     const field = fields.find(f => f[0] === key), current = +$('sim-' + key).value;
     const vals = current === 0 ? [0, Math.max(field[3], policiesFields.has(key) ? 10 : 1), Math.max(field[3], policiesFields.has(key) ? 20 : 2)] : [.5, 1, 1.5].map(m => current * m);
     $('sim-sweep-values').value = [...new Set(vals.map(v => key === 'drivers' ? Math.round(v) : Number(v.toFixed(3))).map(v => Math.min(field[4], Math.max(field[3], v))))].join(',');
@@ -376,7 +418,7 @@
       <div class="sim-table-wrap"><table class="sim-table"><caption>부하 민감도 · 15분 평균 부하의 반복별 피크 평균</caption><thead><tr><th>${escape(label)}</th><th>정책</th><th>A 피크 (kW)</th><th>B 피크 (kW)</th><th>합산 피크 (kW)</th><th>고정 대비 합산 저감률 (%)</th><th>기간 이후 충전량 (kWh)</th></tr></thead><tbody>${output.scenarios.map(s=>s.results.map(r=>`<tr><th>${escape(levelLabel(output.key,s.value))}</th><td>${r.label}</td><td>${fmt(r.load.stationPeakKw?.[0])}</td><td>${fmt(r.load.stationPeakKw?.[1])}</td><td>${fmt(r.load.combinedPeakKw)}</td><td>${fmt(r.load.combinedPeakReductionPct)}</td><td>${fmt(r.load.tailEnergyKwh)}</td></tr>`).join('')).join('')}</tbody></table></div>
       <p class="sim-note">저감률은 해당 수준의 고정요금 대비이며 양수는 감소, 음수는 증가입니다. 20~40분 가정의 등가 전력은 대표 출력을 넘을 수 있습니다. 부하 해석에는 출력 기반 모드를 권장합니다. 위 정책 순위 안내는 피크가 아닌 대기시간 기준입니다.</p>
       <div class="sim-charts">${sim.policies.map((label,p) => `<div><h4>${label} · 평균 대기</h4>${output.scenarios.map(s => `<div class="sim-bar-row"><div class="sim-bar-label"><span>${escape(levelLabel(output.key,s.value))}${s.value === output.baseline ? ' (현재값)' : ''}</span><b>${fmt(s.results[p].wait,2)}분</b></div><div class="sim-track"><div class="sim-fill sim-wait" style="width:${s.results[p].wait/maxWait*100}%"></div></div></div>`).join('')}</div>`).join('')}</div>
-      <p class="sim-note">각 수준의 ‘고정요금 대비’는 그 수준의 고정요금 정책과 비교합니다. ‘현재값 대비’는 현재 기준값에서의 같은 정책과 비교합니다. 동일 난수·초기 잔여시간을 공유하며 인원 변경 시 기존 운전자를 보존하고 추가 인원만 별도 난수로 생성합니다. 상호작용·실세계 예측오차는 분석하지 않습니다.</p>
+      <p class="sim-note">각 수준의 ‘고정요금 대비’는 그 수준의 고정요금 정책과 비교합니다. ‘현재값 대비’는 현재 기준값에서의 같은 정책과 비교합니다. 초기 점유와 난수를 공유하되 충전시간 방식·충전량을 바꾸면 잔여시간도 해당 규칙으로 재계산합니다. 인원 변경 시 기존 운전자를 보존하고 추가 인원만 별도 난수로 생성합니다. 상호작용·실세계 예측오차는 분석하지 않습니다.</p>
       <details><summary>이 분석의 기준 입력 근거</summary>${evidenceTable(output.evidence)}</details>
       <div class="sim-actions"><button type="button" id="sim-sweep-export">민감도 분석 CSV 다운로드</button></div>`;
     $('sim-sweep-export').addEventListener('click', exportSweep);
@@ -409,7 +451,7 @@
       const key = $('sim-sweep-key').value, parts = $('sim-sweep-values').value.split(',').map(s=>s.trim());
       if (parts.some(s=>!s)) throw new Error('쉼표로 구분한 비교값을 입력하세요. 빈 값은 사용할 수 없습니다.');
       const values = key === 'durationMode' ? parts : parts.map(v => Number(v) / (policiesFields.has(key) ? 100 : 1));
-      const prediction = await preparePrediction(); await ensureRoad();
+      const prediction = await preparePrediction(); await ensureRoad(); await ensureTiming($('sim-durationMode').value==='sessions' || (key==='durationMode' && values.includes('sessions')));
       const capturedContext = context(prediction), capturedOptions = options(prediction);
       const currentStations = selected().map(s=>({...s}));
       if (lastSweep) $('sim-sweep-export').disabled = true;
@@ -428,7 +470,7 @@
     lock(true); $('sim-progress').hidden = false;
     message('세 정책에 동일한 운전자를 적용해 계산하고 있습니다…');
     try {
-      const prediction = await preparePrediction(); await ensureRoad();
+      const prediction = await preparePrediction(); await ensureRoad(); await ensureTiming();
       const result = await sim.compare(selected(), options(prediction), p => { $('sim-progress').value = p; }, prediction?.utilizationById);
       result.context = context(prediction);
       result.evidence = sim.evidence(result.stations, result.options, result.context);
@@ -445,7 +487,7 @@
     $('sim-behavior-export').disabled = true; $('sim-behavior-html').disabled = true;
     try {
       $('sim-behavior-status').textContent = '예측과 충전소 상태를 한 번 읽어 두 설정에 공유합니다…';
-      const prediction = await preparePrediction(); await ensureRoad(); const capturedContext = context(prediction);
+      const prediction = await preparePrediction(); await ensureRoad(); await ensureTiming(); const capturedContext = context(prediction);
       const output = await sim.compareBehavior(selected(), options(prediction), p => {$('sim-behavior-status').textContent=`행동계수 비교 중… ${Math.round(p*100)}%`;}, prediction?.utilizationById, ()=>cancelBehavior);
       output.context = {...capturedContext,behaviorPreset:'legacy vs literature'};
       for (const p of output.profiles) {
@@ -500,7 +542,7 @@
     const time=value=>new Date(value).toLocaleTimeString('ko-KR',{timeZone:'Asia/Seoul',hour:'2-digit',minute:'2-digit'});
     $('sim-forecast-summary').innerHTML=`<p class="sim-note">실행 시각부터 남은 ${fmt(plan.minutes,2)}분 · 기대 신규 ${fmt(plan.expectedDrivers,3)}건. 실제 도착 인원 실측이 아닌 충전 시작 건수 추정으로, 반복마다 포아송 차량을 생성합니다. 지난 구간은 제외하고 일부 구간은 남은 시간 비율로 조정합니다. 요금은 각 구간의 이용률에 적용합니다.</p>
       <div class="sim-table-wrap"><table class="sim-table"><thead><tr><th>한국 시각</th><th>A 기대 건수</th><th>B 기대 건수</th><th>A / B 이용률</th></tr></thead><tbody>${plan.intervals.map(b=>`<tr><td>${time(b.startAt)}~${time(b.endAt)}${b.partial?' 일부':''}</td><td>${fmt(b.expected[0],3)}</td><td>${fmt(b.expected[1],3)}</td><td>${fmt(b.utilization[0]*100)} / ${fmt(b.utilization[1]*100)}%</td></tr>`).join('')}</tbody></table></div>
-      <p class="sim-note">초기 상태 수집: ${escape(kst(plan.observedAt))}. kWh·행동계수는 AI 모델에 없어 화면에서 선택한 별도 추정값 또는 사용자 가정을 유지합니다. 충전시간 통계는 참고만 하며 기본 출력 기반 계산을 유지합니다.</p>`;
+      <p class="sim-note">초기 상태 수집: ${escape(kst(plan.observedAt))}. kWh·행동계수는 AI 모델에 없어 화면에서 선택한 별도 추정값 또는 사용자 가정을 유지합니다. 완료 기록 모드를 선택하면 별도로 조회한 원기록 분포를 충전시간에 적용하며, 아래에서 표본과 대체 여부를 확인할 수 있습니다.</p>`;
   }
   function checkForecast() {
     invalidate();
@@ -572,6 +614,9 @@
   $('sim-form').addEventListener('change', invalidate);
   $('sim-energySource').addEventListener('change', ()=>{updateEnergy();invalidate();});
   $('sim-energy').addEventListener('input', ()=>{$('sim-energySource').value='manual';updateEnergy();invalidate();});
+  $('sim-durationMode').addEventListener('change',()=>{showTiming();invalidate();});
+  $('sim-timing-load').addEventListener('click',async()=>{if(busy)return;lock(true);invalidate();try{await ensureTiming(true);}catch(e){message(e.message,true);}finally{lock(false);}});
+  $('sim-mode').addEventListener('change',()=>{if($('sim-mode').value==='real')$('sim-durationMode').value='sessions';});
   for (const id of ['mode', 'region', 'speed']) $('sim-' + id).addEventListener('change', ()=>{updateEnergy();load();});
   for (const id of ['a', 'b', 'distanceMode', 'threshold']) $('sim-' + id).addEventListener('change', ()=>{cards();if ($('sim-pricingBasis').value!=='observed') checkForecast();});
   $('sim-reload').addEventListener('click', load);

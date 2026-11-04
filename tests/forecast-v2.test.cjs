@@ -114,7 +114,7 @@ test('v2 evidence keeps kWh and behavior assumed while exporting forecast timing
   assert.equal(evidence.find(r=>r.item==='신규 운전자').kind,'추정값');
   assert.equal(evidence.find(r=>r.item==='차량당 충전량').kind,'가정값');
   assert.equal(evidence.find(r=>r.item==='이동 비용 α').kind,'가정값');
-  assert.ok(evidence.find(r=>r.item==='A 충전시간 통계 참고').basis.includes('자동 적용하지 않음'));
+  assert.ok(evidence.find(r=>r.item==='A v2 충전시간 통계 참고').basis.includes('kWh는 시간으로 역산하지 않음'));
   output.evidence=evidence;
   const rows=report.rows(output);
   assert.ok(rows.some(r=>r[0]==='시작_ISO'));

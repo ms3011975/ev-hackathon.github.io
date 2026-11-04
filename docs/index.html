@@ -1676,12 +1676,119 @@ window.ESSMonitor.ready = detectServer();
 })();
 </script>
 <script type="application/json" id="sim-config">{"threshold": 0.5, "discount": 0.2, "surcharge": 0.15, "regions": [{"name": "청주시", "code": "43110"}, {"name": "충주시", "code": "43130"}, {"name": "제천시", "code": "43150"}, {"name": "보은군", "code": "43720"}, {"name": "옥천군", "code": "43730"}, {"name": "영동군", "code": "43740"}, {"name": "증평군", "code": "43745"}, {"name": "진천군", "code": "43750"}, {"name": "괴산군", "code": "43760"}, {"name": "음성군", "code": "43770"}, {"name": "단양군", "code": "43800"}]}</script>
-<script>/* Browser + Node pure simulation engine. No network, credentials, or UI dependencies. */
+<script>/* Completed public charging records -> empirical service-time pools. No kWh is inferred. */
+(function(root,factory){if(typeof module==='object'&&module.exports) module.exports=factory();else root.ESSessionTiming=factory();})(typeof globalThis!=='undefined'?globalThis:this,function(){
+  'use strict';
+  const repo='ev-hackathon/ev-hackathon.github.io', minimum=5, days=30;
+  function timestamp(value){
+    const s=String(value||'').trim(), m=/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})$/.exec(s);
+    if(!m) return NaN;
+    const t=Date.UTC(+m[1],+m[2]-1,+m[3],+m[4]-9,+m[5],+m[6]);
+    return new Date(t+32400000).toISOString().slice(0,19).replace('T',' ')===s.replace('T',' ')?t:NaN;
+  }
+  function csv(text){
+    const rows=[];let row=[],cell='',quoted=false;
+    for(let i=0;i<text.length;i++){
+      const c=text[i];
+      if(c==='"'){if(quoted&&text[i+1]==='"'){cell+='"';i++;}else quoted=!quoted;}
+      else if(!quoted&&(c===','||c==='\n')){row.push(cell.replace(/\r$/,''));cell='';if(c==='\n'){rows.push(row);row=[];}}
+      else cell+=c;
+    }
+    if(quoted) throw new Error('세션 CSV의 따옴표 형식이 잘못됐습니다.');
+    if(cell||row.length){row.push(cell.replace(/\r$/,''));rows.push(row);}
+    const header=(rows.shift()||[]).map(s=>s.replace(/^\ufeff/,''));
+    if(!['statId','chgerId','speed','start','end','minutes'].every(k=>header.includes(k))) throw new Error('세션 CSV 필수 열이 없습니다.');
+    return rows.filter(r=>r.some(Boolean)).map(r=>Object.fromEntries(header.map((k,i)=>[k,r[i]||''])));
+  }
+  function clean(rows,asOf){
+    const excluded={invalid:0,outsideWindow:0,duplicate:0,conflicting:0}, seen=new Map(), conflicts=new Set();
+    for(const r of rows){
+      const start=timestamp(r.start),end=timestamp(r.end),minutes=(end-start)/60000, reported=Number(r.minutes);
+      const speed=({'급속':'fast','완속':'slow',fast:'fast',slow:'slow'})[r.speed];
+      if(!r.statId||!r.chgerId||!speed||!Number.isFinite(minutes)||minutes<1||minutes>1440||!Number.isFinite(reported)||Math.abs(minutes-reported)>.2){excluded.invalid++;continue;}
+      if(end>asOf||end<asOf-days*86400000){excluded.outsideWindow++;continue;}
+      const k=`${r.statId}|${r.chgerId}|${start}`;
+      if(conflicts.has(k)){excluded.conflicting++;continue;}
+      if(seen.has(k)){
+        if(seen.get(k).end!==end){seen.delete(k);conflicts.add(k);excluded.conflicting+=2;}
+        else excluded.duplicate++;
+        continue;
+      }
+      seen.set(k,{id:r.statId,speed,start,end,minutes});
+    }
+    return {rows:[...seen.values()],excluded};
+  }
+  function summary(values){
+    const a=[...values].sort((x,y)=>x-y), n=a.length;
+    const q=p=>n?a[Math.min(n-1,Math.floor((n-1)*p))]:null;
+    return {n,mean:n?a.reduce((s,v)=>s+v,0)/n:null,p10:q(.1),p50:q(.5),p90:q(.9)};
+  }
+  function plan(rows,stations,region,asOf,source={}){
+    const c=clean(rows,asOf), pools={}, selected=[];
+    for(const s of stations){
+      const local=c.rows.filter(r=>r.id===s.id&&r.speed===s.speed), regional=c.rows.filter(r=>r.speed===s.speed);
+      const level=local.length>=minimum?'station':regional.length>=minimum?'region':'power';
+      const key=level==='station'?`${s.id}:${s.speed}`:`${region}:${s.speed}:${level}`;
+      if(!pools[key]){const use=level==='station'?local:level==='region'?regional:[];const values=use.map(r=>r.minutes).sort((a,b)=>a-b);
+        pools[key]={level,values,...summary(values),firstEnd:use.length?new Date(use.reduce((a,r)=>Math.min(a,r.end),Infinity)).toISOString():null,lastEnd:use.length?new Date(use.reduce((a,r)=>Math.max(a,r.end),-Infinity)).toISOString():null};}
+      selected.push({id:s.id,speed:s.speed,pool:key,stationN:local.length,regionN:regional.length});
+    }
+    return {version:'completed-sessions-v1',region,asOf:new Date(asOf).toISOString(),minimum,windowDays:days,
+      windowStart:new Date(asOf-days*86400000).toISOString(),source,excluded:c.excluded,rawRows:rows.length,validRows:c.rows.length,pools,stations:selected,
+      residualMethod:'현재 시작시각 미공개: 긴 세션일수록 관측되기 쉬움을 반영해 총시간에 비례하여 표본을 선택하고 잔여 비율을 균등 추출. 정상상태 가정이며 실측 잔여시간 아님'};
+  }
+  function adjusted(pool,energy,kw){
+    const floor=energy/kw*60, values=pool?.values?.length?pool.values.map(t=>Math.max(t,floor)):[floor];
+    const total=values.reduce((s,t)=>s+t,0);let acc=0;
+    const cumulative=values.map(t=>{acc+=t;return acc;});
+    return {values,total,cumulative,minMinutes:floor,clipped:pool?.values?.filter(t=>t<floor).length||0,
+      mean:total/values.length,meanRemaining:values.reduce((s,t)=>s+t*t,0)/(2*total),fallback:!pool?.values?.length};
+  }
+  function sample(pool,u){return pool.values[Math.min(pool.values.length-1,Math.floor(Math.max(0,Math.min(.999999999,u))*pool.values.length))];}
+  function residual(pool,u,v,energy){
+    if(pool.fallback) return {remaining:v*pool.minMinutes,kw:energy*60/pool.minMinutes,total:pool.minMinutes};
+    const target=Math.max(0,Math.min(.999999999,u))*pool.total;let lo=0,hi=pool.cumulative.length-1;
+    while(lo<hi){const mid=(lo+hi)>>1;if(pool.cumulative[mid]>target)hi=mid;else lo=mid+1;}
+    const total=pool.values[lo];return {remaining:v*total,total,kw:energy*60/total};
+  }
+  function createClient(fetcher,{now=Date.now}={}){
+    let indexPromise=null,indexAt=0;const regions=new Map();
+    async function json(url){const r=await fetcher(url,{credentials:'omit',cache:'no-store',signal:AbortSignal.timeout(20000)});if(!r.ok)throw new Error(`세션 자료 응답 ${r.status}`);return r.json();}
+    async function index(){
+      if(!indexPromise||now()-indexAt>1800000){indexAt=now();indexPromise=(async()=>{
+        const commit=await json(`https://api.github.com/repos/${repo}/commits/history`);
+        if(!/^[a-f0-9]{40}$/.test(commit.sha))throw new Error('세션 이력 버전을 확인하지 못했습니다.');
+        const tree=await json(`https://api.github.com/repos/${repo}/git/trees/${commit.sha}?recursive=1`);
+        if(tree.truncated||!Array.isArray(tree.tree))throw new Error('세션 파일 목록이 불완전합니다.');return {sha:commit.sha,files:tree.tree};
+      })().catch(e=>{indexPromise=null;throw e;});}
+      return indexPromise;
+    }
+    async function load(stations,region,asOf=now()){
+      if(!/^\d{5}$/.test(region))throw new Error('세션 분석 지역을 확인하세요.');
+      const idx=await index(), key=idx.sha+':'+region+':'+new Date(asOf+32400000).toISOString().slice(0,10);
+      if(!regions.has(key)) regions.set(key,(async()=>{
+        const first=new Date(asOf-days*86400000+32400000).toISOString().slice(0,10),last=new Date(asOf+32400000).toISOString().slice(0,10);
+        const files=idx.files.filter(f=>f.type==='blob'&&new RegExp(`^history/sessions/\\d{4}-\\d{2}-\\d{2}/${region}\\.csv$`).test(f.path)&&f.path.split('/')[2]>=first&&f.path.split('/')[2]<=last);
+        const rows=[];for(let i=0;i<files.length;i+=4){
+          const batch=await Promise.all(files.slice(i,i+4).map(async f=>{const r=await fetcher(`https://raw.githubusercontent.com/${repo}/${idx.sha}/${f.path}`,{credentials:'omit',signal:AbortSignal.timeout(20000)});if(!r.ok)throw new Error(`세션 파일 응답 ${r.status}`);return csv(await r.text());}));batch.forEach(a=>rows.push(...a));
+        }
+        return {rows,files:files.map(f=>f.path)};
+      })().catch(e=>{regions.delete(key);throw e;}));
+      const data=await regions.get(key);
+      return plan(data.rows,stations,region,asOf,{repository:`https://github.com/${repo}/tree/${idx.sha}/history/sessions`,commit:idx.sha,files:data.files,fetchedAt:new Date(now()).toISOString()});
+    }
+    return {load};
+  }
+  return {timestamp,csv,clean,summary,plan,adjusted,sample,residual,createClient};
+});
+
+/* Browser + Node pure simulation engine. No network, credentials, or UI dependencies. */
 (function (root, factory) {
   if (typeof module === 'object' && module.exports) module.exports = factory();
   else root.ESSimulation = factory();
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
   'use strict';
+  const timing = typeof module === 'object' && module.exports ? require('./session-timing.js') : globalThis.ESSessionTiming;
   const energyProfile = typeof module === 'object' && module.exports ? require('../data/jeju_energy_summary.json') : {
   "schemaVersion": 1,
   "sourceTitle": "제주특별자치도_전체 전기차자동차 충전 이력 데이터(파일)_20221130",
@@ -1896,7 +2003,17 @@ window.ESSMonitor.ready = detectServer();
       if (!Number.isFinite(o[key]) || o[key] < lo || o[key] > hi || (integer && !Number.isInteger(o[key])))
         throw new Error(`${key}: ${lo}~${hi}${integer ? ' 정수' : ''} 값을 입력하세요.`);
     }
-    if (!['assumed', 'power'].includes(o.durationMode)) throw new Error('충전시간 계산 방식을 확인하세요.');
+    if (!['assumed', 'power', 'sessions'].includes(o.durationMode)) throw new Error('충전시간 계산 방식을 확인하세요.');
+    if (o.durationMode === 'sessions') {
+      const p = o.sessionPlan;
+      if (p?.version !== 'completed-sessions-v1' || p.stations?.length !== stations.length || p.stations.some((s,i)=>s.id!==stations[i].id || s.speed!==stations[i].speed || !p.pools?.[s.pool]))
+        throw new Error('선택 충전소의 완료 세션 자료를 먼저 불러오세요.');
+      for (const s of p.stations) {
+        const pool=p.pools[s.pool];
+        if (!['station','region','power'].includes(pool.level) || !Array.isArray(pool.values) || pool.values.some(v=>!Number.isFinite(v)||v<1||v>1440) ||
+            (pool.level==='power' ? pool.values.length!==0 : pool.values.length<5)) throw new Error('완료 세션 표본·대체 기준을 확인하세요.');
+      }
+    }
     if (o.roadDistances !== undefined && (!Array.isArray(o.roadDistances) || o.roadDistances.length!==2 || o.roadDistances.some(v=>!Number.isFinite(v)||v<0||v>200)))
       throw new Error('A→B / B→A 도로 거리를 확인하세요 (각 0~200km).');
     if (stations.length !== 2 || stations[0].id === stations[1].id || stations[0].speed !== stations[1].speed)
@@ -1919,20 +2036,27 @@ window.ESSMonitor.ready = detectServer();
         for (let n=0;n<count;n++) drivers.push({id:drivers.length,origin,arrival:bin.start+random()*(bin.end-bin.start),duration:20+random()*20,choice:random()});
       }
       drivers.sort((a,b)=>a.arrival-b.arrival||a.id-b.id);
-      return { initial, drivers };
+      return { initial, drivers, initialDuration: stations.map(s=>Array.from({length:s.charging},()=>random())) };
     }
     const drivers = Array.from({ length: o.drivers }, (_, id) => ({ id, arrival: random() * o.minutes, duration: 20 + random() * 20, choice: random() }))
       .sort((a, b) => a.arrival - b.arrival || a.id - b.id);
-    return { initial, drivers };
+    return { initial, drivers, initialDuration: stations.map(s=>Array.from({length:s.charging},()=>random())) };
   }
-  const duration = (s, o, assumed) => o.durationMode === 'power' ? o.energy / s.kw * 60 : assumed;
+  function duration(s, o, assumed) {
+    if (o.durationMode==='assumed') return assumed;
+    const floor=o.energy/s.kw*60;
+    if (o.durationMode!=='sessions') return floor;
+    const entry=o.sessionPlan.stations.find(e=>e.id===s.id&&e.speed===s.speed), pool=o.sessionPlan.pools[entry.pool];
+    return pool.values.length ? Math.max(floor,timing.sample(pool,(assumed-20)/20)) : floor;
+  }
   const diversionDistance = (origin, destination, o) => origin === destination ? 0 : o.roadDistances?.[origin] ?? o.distance;
   // Energy-conserving constant equivalent power, not measured grid demand.
-  // Initial sessions use representative output because their remaining energy is unknown.
+  // Empirical initial sessions use energy / adjusted total duration; legacy modes use rated output.
   function loadProfile(stations, o, initial, records) {
     const intervalMinutes = 15, events = [];
-    initial.forEach((remaining, station) => remaining.forEach(end => {
-      if (end > 0) events.push({ station, start: 0, end, kw: stations[station].kw, initial: true });
+    initial.forEach((remaining, station) => remaining.forEach(item => {
+      const end=typeof item==='number'?item:item.remaining, kw=typeof item==='number'?stations[station].kw:item.kw;
+      if (end > 0) events.push({ station, start: 0, end, kw, initial: true });
     }));
     let overRatedSessions = 0;
     for (const r of records) {
@@ -1981,7 +2105,8 @@ window.ESSMonitor.ready = detectServer();
       stationEnergyKwh, initialEnergyKwh, newEnergyKwh: records.length * o.energy,
       tailEnergyKwh, unfinishedAtHorizon: records.filter(r => r.end > o.minutes).length,
       windowUtilization, utilizationGapPp: windowUtilization.every(v => v !== null) ? Math.abs(windowUtilization[0] - windowUtilization[1]) * 100 : null,
-      overRatedSessions, lastCompletionMinutes };
+      overRatedSessions, lastCompletionMinutes,
+      extendedSessions: records.filter(r=>r.durationExtended).length };
   }
   function runPolicy(stations, o, people, policy, utilizationById) {
     const priceSchedule = o.forecastPlan?.intervals.map(bin=> {
@@ -1989,10 +2114,12 @@ window.ESSMonitor.ready = detectServer();
       return {start:bin.start,end:bin.end,prices:stations.map(s=>price(s,policy,o,u))};
     });
     const prices = priceSchedule ? stations.map((s,i)=>priceSchedule.reduce((n,b)=>n+b.prices[i]*(b.end-b.start),0)/o.minutes) : stations.map(s => price(s, policy, o, utilizationById));
-    const queues = stations.map((s, i) => [
-      ...Array(s.avail).fill(0), ...people.initial[i].map(u => u * duration(s, o, 30))
-    ]);
-    const initial = queues.map(q => q.filter(t => t > 0));
+    const initial = stations.map((s,i)=>{
+      if (o.durationMode!=='sessions') return people.initial[i].map(u=>u*duration(s,o,30));
+      const pool=o.sessionPlan.pools[o.sessionPlan.stations[i].pool], adjusted=timing.adjusted(pool,o.energy,s.kw);
+      return people.initial[i].map((u,j)=>timing.residual(adjusted,people.initialDuration[i][j],u,o.energy));
+    });
+    const queues = stations.map((s, i) => [...Array(s.avail).fill(0),...initial[i].map(v=>typeof v==='number'?v:v.remaining)]);
     const records = [], count = [0, 0];
     let wait = 0, estimated = 0, charge = 0, distance = 0, discount = 0, completion = 0;
     for (const d of people.drivers) {
@@ -2010,7 +2137,10 @@ window.ESSMonitor.ready = detectServer();
       q[slot] = end; count[i]++; wait += actual; estimated += expected[i];
       charge += o.energy * quote[i]; distance += diversionDistance(origin,i,o);
       discount += o.energy * Math.max(0, stations[i].base - quote[i]); completion = Math.max(completion, end);
-      records.push({ driver: d.id, origin, station: i, price:quote[i], extraDistance:diversionDistance(origin,i,o), arrival: d.arrival, expectedWait: expected[i], actualWait: actual, start, end });
+      let observedDuration=null;
+      if (o.durationMode==='sessions') { const pool=o.sessionPlan.pools[o.sessionPlan.stations[i].pool]; if(pool.values.length) observedDuration=timing.sample(pool,(d.duration-20)/20); }
+      records.push({ driver: d.id, origin, station: i, price:quote[i], extraDistance:diversionDistance(origin,i,o), arrival: d.arrival, expectedWait: expected[i], actualWait: actual, start, end,
+        observedDuration, durationExtended: observedDuration!==null && observedDuration < o.energy/stations[i].kw*60 });
     }
     const n = people.drivers.length, denominator = n || 1;
     return { policy, prices, priceSchedule, drivers:n, count, share: count.map(v => v / denominator), wait: wait / denominator,
@@ -2039,8 +2169,8 @@ window.ESSMonitor.ready = detectServer();
           if (!out.load) out.load = { available: true, intervalMinutes: l.intervalMinutes, capacityKw: l.capacityKw,
             stationPeakKw: [0, 0], stationEnergyKwh: [0, 0], windowUtilization: l.windowUtilization.map(v => v === null ? null : 0),
             combinedPeakKw: 0, initialEnergyKwh: 0, newEnergyKwh: 0, tailEnergyKwh: 0, unfinishedAtHorizon: 0,
-            overRatedSessions: 0, lastCompletionMinutes: 0, utilizationGapPp: l.utilizationGapPp === null ? null : 0, series: [] };
-          for (const key of ['combinedPeakKw','initialEnergyKwh','newEnergyKwh','tailEnergyKwh','unfinishedAtHorizon','overRatedSessions','lastCompletionMinutes']) out.load[key] += l[key] / o.repeats;
+            overRatedSessions: 0, extendedSessions: 0, lastCompletionMinutes: 0, utilizationGapPp: l.utilizationGapPp === null ? null : 0, series: [] };
+          for (const key of ['combinedPeakKw','initialEnergyKwh','newEnergyKwh','tailEnergyKwh','unfinishedAtHorizon','overRatedSessions','extendedSessions','lastCompletionMinutes']) out.load[key] += l[key] / o.repeats;
           if (l.utilizationGapPp !== null) out.load.utilizationGapPp += l.utilizationGapPp / o.repeats;
           for (let i = 0; i < 2; i++) {
             out.load.stationPeakKw[i] += l.stationPeakKw[i] / o.repeats;
@@ -2116,14 +2246,14 @@ window.ESSMonitor.ready = detectServer();
       const people = population(stations, base, random), extraRandom = rng((base.seed ^ Math.imul(r + 1, 0x9e3779b1)) >>> 0);
       const drivers = people.drivers.map(d => ({ ...d }));
       if (!base.forecastPlan) for (let id = base.drivers; id < maxDrivers; id++) drivers.push({ id, arrival: extraRandom() * base.minutes, duration: 20 + extraRandom() * 20, choice: extraRandom() });
-      bank.push({ initial: people.initial, drivers });
+      bank.push({ initial: people.initial, initialDuration:people.initialDuration, drivers });
     }
     const scenarios = [];
     for (let i = 0; i < levels.length; i++) {
       if (cancelled()) throw new Error('분석을 중단했습니다.');
       const value = levels[i], o = { ...base, [key]: value };
       if (key === 'distance' && value !== base.distance) delete o.roadDistances;
-      const populations = bank.map(p => ({ initial: p.initial, drivers: p.drivers.filter(d => base.forecastPlan || d.id < o.drivers)
+      const populations = bank.map(p => ({ initial: p.initial, initialDuration:p.initialDuration, drivers: p.drivers.filter(d => base.forecastPlan || d.id < o.drivers)
         .map(d => ({ ...d, arrival: o.minutes === base.minutes ? d.arrival : d.arrival / base.minutes * o.minutes })).sort((a, b) => a.arrival - b.arrival || a.id - b.id) }));
       const output = await compare(stations, o, p => onProgress((i + p) / levels.length), utilizationById, { populations, cancelled });
       scenarios.push({ value, ...output });
@@ -2175,8 +2305,21 @@ window.ESSMonitor.ready = detectServer();
         `${context.roadRoute?.provider || 'OSRM car'} · 조회 ${context.roadRoute?.fetchedAt || '기록 없음'} · ${context.roadRoute?.url || ''}. OSM 도로 연결점 기준 최단시간 경로 거리. 실시간 교통·GPS 실측 아님. 도로 연결 오차 ${JSON.stringify(context.roadRoute?.snapMeters || [])}m. 원래 선택지에서는 0km, 변경 방향에 맞는 거리를 적용. 이동시간은 도착 시각에 더하지 않음. 차량 출발지·최종 목적지가 없어 실제 우회거리로 대체하는 가정이 남음.`);
     } else if (context.distanceMode === 'road') add('대체 충전소 도로 거리','조회 필요','미입력','도로 거리 조회가 완료되어야 실행할 수 있음. 직선거리로 자동 대체하지 않음');
     else add(o.forecastPlan ? '대체 충전소 추가 거리' : 'B 추가 거리', `${o.distance}km`, context.distanceMode === 'coords' ? '추정값' : '가정값', (context.distanceMode === 'coords' ? 'A/B 좌표의 직선거리. 도로 거리·이동시간 아님' : '사용자 지정 추가 거리. 양방향 동일 가정.') + (o.forecastPlan ? ' 원래 A/B 선택지에서는 0km, 다른 곳으로 바꾸면 추가 거리 적용' : ' A는 0km 가정'));
-    add('신규 충전시간', o.durationMode === 'power' ? '충전량 ÷ 대표 출력 × 60분' : '20~40분 균등분포', '가정값', '간소화 모델. 충전효율·충전곡선·출력 공유 제외');
-    add('초기 잔여 충전시간', o.durationMode === 'power' ? '0~(충전량 ÷ 대표 출력 × 60)분 균등분포' : '0~30분 균등분포', '가정값', '초기 차량의 실제 잔여시간은 관측하지 않음');
+    if (o.durationMode==='sessions') {
+      const p=o.sessionPlan;
+      add('신규 충전시간','최근 완료 세션의 경험분포에서 추출',p?'추정값':'미입력','급속·완속 구분. 선택 충전소 5건 이상 → 같은 지역·종류 5건 이상 → 충전량÷대표 출력 순서. 짧은 표본은 충전량÷대표 출력까지 연장해 에너지·출력 상한을 함께 보존');
+      add('초기 잔여 충전시간','총시간 길이 비례 표본 + 0~총시간 잔여 비율',p?'추정값':'미입력','현재 진행 중 세션의 시작시각은 공개 자료에 없음. 긴 세션이 점유 상태로 관측될 확률이 높은 정상상태를 가정. 실제 잔여시간 아님. 세션별 일정 등가 전력=별도 충전량÷보정 총시간');
+      if(p) {
+        add('완료 세션 출처',p.source.repository,'실측·수집값',`고정 버전 ${p.source.commit} · 분석 기준 ${p.asOf} · 종료 시각 기준 최근 ${p.windowDays}일 (${p.windowStart}~${p.asOf}) · 파일 ${JSON.stringify(p.source.files)}`);
+        add('완료 세션 정제',`${p.rawRows}행 → 유효 ${p.validRows}건`,'실험 설정',`1~1440분, 시작·종료 시각 및 minutes 일치 검사. 미래·기간 외, 중복, 동일 시작의 종료 충돌 제외: ${JSON.stringify(p.excluded)}. 수집 초기·기기별 보고 차이로 표본이 불균등할 수 있음. 5건은 최소 처리 규칙이며 통계적 신뢰성을 보장하지 않음. 지역 대체는 장소·출력·차종 구성이 다를 수 있음. 기록은 비충전 점유를 포함할 수 있음`);
+        p.stations.forEach((entry,i)=>{const pool=p.pools[entry.pool],s=stations[i],a=timing.adjusted(pool,o.energy,s.kw),f=n=>Number(n).toFixed(2);
+          add(`${i?'B':'A'} 적용 충전시간`,pool.values.length?`${pool.level==='station'?'해당 충전소':'같은 지역·종류'} ${pool.values.length}건 · 평균 ${f(pool.mean)} / P10 ${f(pool.p10)} / 중앙 ${f(pool.p50)} / P90 ${f(pool.p90)}분`:'표본 부족 → 충전량÷대표 출력',pool.values.length?'추정값':'가정값',`충전소 ${entry.stationN}건 / 지역 ${entry.regionN}건. 실제 종료 기록 범위 ${pool.firstEnd||'없음'}~${pool.lastEnd||'없음'}. 적용 신규 평균 ${f(a.mean)}분, 초기 잔여 기대 ${f(a.meanRemaining)}분. 최소 ${f(a.minMinutes)}분으로 연장되는 원표본 ${a.clipped}건. 초기 차량도 별도 충전량 ${o.energy}kWh를 총 세션량으로 가정하며 시간으로 kWh를 역산하지 않음`);
+        });
+      }
+    } else {
+      add('신규 충전시간', o.durationMode === 'power' ? '충전량 ÷ 대표 출력 × 60분' : '20~40분 균등분포', '가정값', '간소화 모델. 충전효율·충전곡선·출력 공유 제외');
+      add('초기 잔여 충전시간', o.durationMode === 'power' ? '0~(충전량 ÷ 대표 출력 × 60)분 균등분포' : '0~30분 균등분포', '가정값', '초기 차량의 실제 잔여시간은 관측하지 않음');
+    }
     add('도착·선택 모형', o.forecastPlan ? '구간·원래 선택지별 포아송 건수 + 구간 내 균등 도착 · 로짓 재선택' : '기간 내 균등 도착 · 로짓 선택', '가정값', '취소·포기·추가 이동시간 제외. 행동모델 실측 보정 전');
     add('반복·난수', `${o.repeats}회 · 시드 ${o.seed}`, '실험 설정', '재현성과 반복 변동 확인용. 반복 횟수는 실세계 정확도를 보장하지 않음');
     add('요금 판정 근거', context.pricingBasis || '현재 수집 상태', context.forecastInfo ? '추정값' : context.forecastRequested ? '미입력' : real ? '실측·수집값' : '가정값', context.forecastInfo ? `${context.forecastInfo} · 외부 예측. 정확도·학습자료는 이 사이트에서 검증하지 않음` : context.forecastRequested ? '예측 JSON이 없거나 아직 검증되지 않았습니다. 실행 시 검증합니다.' : '시작 시 상태에 정책을 적용하고 단가 고정');
@@ -2188,7 +2331,7 @@ window.ESSMonitor.ready = detectServer();
       add('실험 시작·초기 상태 시각', `${p.startAt} / 수집 ${p.observedAt}`, '실험 설정', '실행 시점부터 남은 구간만 사용. 과거 구간 제외, 일부 구간의 건수는 남은 시간 비율로 조정. 수집 후 상태는 유지한다고 가정');
       add('v2 건수 방법', JSON.stringify(p.method), '추정값', '모델 제공 방법 설명. 이용률·충전시간 기반 시작 건수 추정이며 가격 반응을 학습한 모델은 아님');
       add('v2 시작 건수 검증', JSON.stringify(p.validation), '추정값', '제공 모델의 검증 참고. 초기 세션 기록에 따른 제한이 있으며 실측 도착 수 검증이 아님');
-      (p.stationStats || []).forEach((s,i)=>{if(s) add(`${i?'B':'A'} 충전시간 통계 참고`, `${s.mean_duration_minutes}분 · ${s.duration_level}`, '추정값', '모델 제공 충북 세션 통계/지역 대체 평균. kWh를 알 수 없어 충전시간·에너지에 자동 적용하지 않음');});
+      (p.stationStats || []).forEach((s,i)=>{if(s) add(`${i?'B':'A'} v2 충전시간 통계 참고`, `${s.mean_duration_minutes}분 · ${s.duration_level}`, '추정값', 'v2 제공 요약은 참고용. 완료 세션 모드는 별도로 불러온 원기록의 경험분포를 사용. kWh는 시간으로 역산하지 않음');});
     }
     return rows;
   }
@@ -2224,6 +2367,7 @@ window.ESSMonitor.ready = detectServer();
     ['도착 기간 종료 시 미완료 신규 차량 (명)', r => r.load.unfinishedAtHorizon],
     ['초기·신규 차량 최종 완료 (시작 후 분)', r => r.load.lastCompletionMinutes],
     ['대표 출력 초과 등가 전력의 신규 차량 (명)', r => r.load.overRatedSessions],
+    ['충전량·출력 상한에 맞춰 시간을 연장한 신규 차량 (명)', r => r.load.extendedSessions || 0],
     ['평균 실제 대기 (분)', r => r.wait],
     ['평균 추가 거리 (km/명)', r => r.distance],
     ['평균 충전비 (원/명)', r => r.fee],
@@ -2266,7 +2410,7 @@ window.ESSMonitor.ready = detectServer();
     const time=t=>new Date(t).toLocaleTimeString('ko-KR',{timeZone:'Asia/Seoul',hour:'2-digit',minute:'2-digit'});
     return `<h4>v2 기준 수요와 구간별 요금</h4><p class="sim-note">실험 시작 ${esc(kst(p.startAt))} · 초기 상태 수집 ${esc(kst(p.observedAt))} · 충전 시작 건수 추정. 현재 적용할 구간만 사용하며 처음 일부 구간은 남은 시간 비례입니다. 원래 A/B 선택지와 포아송 생성 차량을 모든 정책이 공유하고 재선택합니다. 충전량·행동계수는 별도 추정값 또는 사용자 가정입니다.</p>
       <div class="sim-table-wrap"><table class="sim-table"><thead><tr><th>한국 시각</th><th>A 기대 건수</th><th>B 기대 건수</th><th>A / B 이용률 (%)</th>${result.results.map(r=>`<th>${esc(r.label)} A / B 단가</th>`).join('')}</tr></thead><tbody>${p.intervals.map((b,i)=>`<tr><td>${time(b.startAt)}~${time(b.endAt)}${b.partial?' 일부':''}</td><td>${fmt(b.expected[0],3)}</td><td>${fmt(b.expected[1],3)}</td><td>${fmt(b.utilization[0]*100)} / ${fmt(b.utilization[1]*100)}</td>${result.results.map(r=>`<td>${r.priceSchedule[i].prices.map(v=>fmt(v,1)).join(' / ')}</td>`).join('')}</tr>`).join('')}</tbody></table></div>
-      <p class="sim-note">요금은 구간 이용률의 정책 판정으로 정하고 차량은 도착 시 선택 단가를 충전 종료까지 적용합니다. 평균 단가는 시간가중 평균입니다. 제공된 충전시간 평균은 참고용이며 에너지·소요시간에 자동 적용하지 않습니다.</p>`;
+      <p class="sim-note">요금은 구간 이용률의 정책 판정으로 정하고 차량은 도착 시 선택 단가를 충전 종료까지 적용합니다. 평균 단가는 시간가중 평균입니다. v2 제공 평균은 참고용입니다. 완료 기록 모드에서는 별도 원기록의 경험분포를 적용하며 kWh는 별도 추정값을 유지합니다.</p>`;
   }
   function render(result) {
     if (!valid(result)) return `<h3>충전 부하 집중 변화 리포트</h3><p>${esc(result.results.find(r=>!r.load?.available)?.load?.reason || '부하 집계를 사용할 수 없습니다.')}</p>`;
@@ -2278,7 +2422,8 @@ window.ESSMonitor.ready = detectServer();
       <p>${esc(c.source)} · ${esc(c.region)}<br>실행 시각: ${esc(kst(c.executedAt || '기록 없음'))}<br>요금 근거: ${esc(c.pricingBasis)} ${esc(c.forecastInfo)}<br>A: ${esc(result.stations[0].name)} (${esc(result.stations[0].id)}) / B: ${esc(result.stations[1].name)} (${esc(result.stations[1].id)})<br>신규 ${fmt(o.drivers,3)}명${o.forecastPlan?' (기대값)':''} · 도착 ${fmt(o.minutes)}분 · 차량당 ${o.energy}kWh · ${o.repeats}회 · 시드 ${o.seed}</p>
       ${o.forecastPlan ? `<p class="sim-status">생성 평균 ${fmt(result.population.mean,3)}명 · 범위 ${result.population.min}~${result.population.max}명 · 신규 0명 반복 ${result.population.emptyRuns}/${o.repeats}회. 대기시간·비용·거리는 전체 생성 차량을 기준으로 집계합니다. 모든 반복이 0명이라면 선택·대기·비용의 0은 효과 측정값을 의미하지 않습니다.</p>` : ''}
       ${roadNotice(o,c)}${forecastTable(result)}
-      ${overRated ? '<p class="sim-status" data-error="true">충전량과 가정 충전시간으로 계산한 등가 전력이 대표 출력을 넘는 차량이 있습니다. 현재 결과는 에너지 보존 시나리오이며 물리적으로 가능한 부하로 해석할 수 없습니다. 신규 차량 충전시간을 ‘충전량 ÷ 대표 출력’으로 바꾸어 다시 실행하세요.</p>' : '<p class="sim-note">신규 차량은 충전량÷소요시간의 일정 전력, 초기 차량은 대표 출력×가정 잔여시간으로 계산합니다. 실제 충전곡선·효율·출력 공유·비충전 부하는 제외합니다.</p>'}
+      ${o.durationMode==='sessions'?'<p class="sim-status">완료 세션 기록 기반 시간 추정. 초기 잔여시간은 진행 중 시작시각 없이 정상상태 모형으로 추정합니다. 원기록보다 짧게 충전하여 대표 출력을 넘지 않도록 최소시간(충전량÷대표 출력)까지 연장하며, 아래에 연장 차량 수를 표시합니다. 기록에는 비충전 점유가 포함될 수 있습니다. 표본·출처·보정 평균은 ‘입력값과 근거’에서 확인하세요.</p>':''}
+      ${overRated ? '<p class="sim-status" data-error="true">충전량과 가정 충전시간으로 계산한 등가 전력이 대표 출력을 넘는 차량이 있습니다. 현재 결과는 에너지 보존 시나리오이며 물리적으로 가능한 부하로 해석할 수 없습니다. 신규 차량 충전시간을 ‘충전량 ÷ 대표 출력’으로 바꾸어 다시 실행하세요.</p>' : '<p class="sim-note">신규 차량은 충전량÷소요시간의 일정 전력, 초기 차량은 완료 기록 모드에서 (충전량÷보정 총시간)×추정 잔여시간, 그 외에는 대표 출력×가정 잔여시간으로 계산합니다. 실제 충전곡선·효율·출력 공유·비충전 부하는 제외합니다.</p>'}
       <div class="sim-table-wrap"><table class="sim-table"><caption>각 반복에서 지표를 계산한 뒤 평균 · 피크 저감률은 양수=감소, 음수=증가</caption><thead><tr><th>지표</th>${results.map(r=>`<th>${esc(r.label)}</th>`).join('')}</tr></thead><tbody>${metrics.map(([label,get])=>`<tr><th scope="row">${label}</th>${results.map(r=>`<td>${fmt(get(r))}</td>`).join('')}</tr>`).join('')}</tbody></table></div>
       <div class="sim-report-findings">${results.slice(1).map(r=>`<p><strong>${esc(r.label)}</strong>: 고정요금 대비 A 피크 저감률 ${pct(r.load.stationPeakReductionPct[0])}, B ${pct(r.load.stationPeakReductionPct[1])}, 합산 ${pct(r.load.combinedPeakReductionPct)}. 합산 피크 차이는 ${fmt(r.load.combinedPeakDeltaKw)}kW이고, 평균 대기 차이는 ${fmt(r.wait-results[0].wait)}분입니다.</p>`).join('')}</div>
       <p class="sim-note">A의 피크가 줄어도 B 또는 합산 피크는 증가할 수 있습니다. 합산 피크는 같은 시각의 A+B 곡선에서 계산하며 A 피크+B 피크를 더하지 않습니다. SE는 반복 난수에 따른 표준오차이며 모델·행동 가정·미래 예측의 불확실성을 포함하지 않습니다.</p>
@@ -2405,6 +2550,8 @@ window.ESSMonitor.ready = detectServer();
   const sim = window.ESSimulation, config = JSON.parse(document.getElementById('sim-config').textContent);
   const routing = window.ESSRouting, roadClient = routing.createClient((url, opts)=>fetch(url, opts));
   let roadState = null, roadTimer;
+  const timingClient=window.ESSessionTiming.createClient((url,opts)=>fetch(url,opts));
+  let sessionState=null;
   const $ = id => document.getElementById(id), escape = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
   const fmt = (n, d = 1) => Number.isFinite(n) ? n.toLocaleString('ko-KR', { minimumFractionDigits: d, maximumFractionDigits: d }) : '—';
   const kst = value => Number.isFinite(Date.parse(value)) ? new Date(value).toLocaleString('ko-KR',{timeZone:'Asia/Seoul',hourCycle:'h23'})+' (한국 시각)' : String(value ?? '');
@@ -2442,7 +2589,9 @@ window.ESSMonitor.ready = detectServer();
         <label class="sim-wide">추가 거리 산정<select id="sim-distanceMode"><option value="road">자동차 도로 이동거리 · 방향별 자동 조회</option><option value="manual">사용자 입력 거리 · 양방향 동일 가정</option></select></label>
         <p id="sim-road-status" class="sim-note sim-wide" role="status"></p>
         <button type="button" class="sim-wide" id="sim-road-reload">도로 거리 다시 조회</button>
-        <label class="sim-wide">신규 차량 충전시간 ${badge('가정값')}<select id="sim-durationMode"><option value="power"${sim.defaults.durationMode === 'power' ? ' selected' : ''}>충전량 ÷ 대표 출력 × 60분 (기본)</option><option value="assumed"${sim.defaults.durationMode === 'assumed' ? ' selected' : ''}>20~40분 균등분포 (간소화 가정)</option></select></label>
+        <label class="sim-wide">신규·초기 차량 충전시간 <span id="sim-kind-duration">${badge('추정값')}</span><select id="sim-durationMode"><option value="sessions" selected>충전 시작·종료 기록 기반 추정 (실제 데이터 기본)</option><option value="power">충전량 ÷ 대표 출력 × 60분</option><option value="assumed">20~40분 균등분포 (간소화 가정)</option></select></label>
+        <p class="sim-wide sim-note" id="sim-timing-status" role="status">실행 시 최근 완료 세션을 자동으로 불러옵니다.</p>
+        <button type="button" class="sim-wide" id="sim-timing-load">충전시간 기록 불러오기</button>
         <label class="sim-wide">요금·수요 기준<select id="sim-pricingBasis"><option value="observed">현재 수집 상태 + 수동 수요</option><option value="forecast">AI 1시간 후 이용률 + 수동 수요 (v1)</option><option value="forecast-v2">AI 15분 구간 이용률·신규 건수 (v2)</option></select></label>
       </div>
       <div id="sim-forecast-panel" hidden>
@@ -2492,13 +2641,14 @@ window.ESSMonitor.ready = detectServer();
           <button id="sim-sweep-run" type="button" class="sim-primary">민감도 분석 실행</button>
         </fieldset>
         <button id="sim-sweep-cancel" type="button" hidden>분석 중단</button>
-        <p class="sim-note">비교값은 최대 8개입니다. 정책 비율은 화면과 동일한 % 단위입니다. 거리 변경은 사용자 가정 시나리오로 취급합니다. 충전시간 방식은 assumed(20~40분), power(출력 기반)를 사용합니다. 제안값은 검증된 현실 범위가 아닙니다.</p>
+        <p class="sim-note">비교값은 최대 8개입니다. 정책 비율은 화면과 동일한 % 단위입니다. 거리 변경은 사용자 가정 시나리오로 취급합니다. 충전시간 방식은 sessions(완료 기록), power(출력 기반), assumed(20~40분)입니다. 제안값은 검증된 현실 범위가 아닙니다.</p>
         <p id="sim-sweep-status" class="sim-status" role="status" aria-live="polite">항목과 비교값을 확인한 뒤 실행하세요.</p>
         <div id="sim-sweep-results"></div>
       </section>
       <details class="sim-card"><summary>모델 가정과 결과 읽는 방법</summary>
         <p>수동 수요는 기간 내 균등 도착이며 A를 원래 목적지로 둡니다. v2는 충전소·구간별 기대 충전 시작 건수를 평균으로 하는 독립 포아송 건수와 구간 내 균등 도착을 가정합니다. 원래 선택지는 A/B별로 보존하고 다른 충전소로 바꿀 때만 추가 거리를 적용합니다. 이동 소요시간은 따로 더하지 않습니다.</p>
-        <p>기본 충전시간은 충전량÷대표 출력×60분이며 초기 차량 잔여시간은 0~해당 시간의 균등분포입니다. 선택 가능한 20~40분 가정 모드에서는 초기 잔여시간을 0~30분으로 둡니다. 충전효율·배터리 충전곡선·출력 공유는 반영하지 않습니다. 혼합 출력 충전소는 기존 관제의 대표 출력·단가를 동일하게 적용합니다.</p>
+        <p>실제 데이터의 기본 시간은 최근 30일 완료 세션 기록에서 추출합니다. 같은 충전소·종류 5건 이상, 부족하면 같은 지역·종류 5건 이상을 사용하며 모두 부족하면 출력 기반으로 대체합니다. 현재 진행 중 세션의 시작시각은 공개되지 않아 초기 잔여시간은 총시간 길이 비례 표본과 균등 잔여 비율로 추정합니다(정상상태 가정). 수집 초기에는 실제 표본 기간이 짧습니다. 기록에는 비충전 점유가 포함될 수 있습니다.</p>
+        <p>kWh는 기록에 없어 별도 제주 추정값/사용자 가정을 유지합니다. 기록 시간이 충전량÷대표 출력×60분보다 짧으면 그 최소시간까지 연장하고 표본 수와 결과의 연장 차량 수를 표시합니다. 신규·초기 차량의 등가 전력은 충전량÷보정 총시간으로 계산합니다. 출력 기반 모드의 초기 잔여는 0~총시간, 20~40분 모드의 초기 잔여는 0~30분 균등분포입니다. 충전곡선·효율·출력 공유는 제외합니다.</p>
         <p>판정 분모는 빈 충전기+충전 중이며 고장·미확인 충전기는 처리 능력에서 제외합니다. 수동/v1 요금은 고정하고 v2는 각 도착 구간의 예측 이용률로 요금을 정합니다. 요금표는 시간가중 평균 단가이며 차량은 선택 시 단가를 충전 종료까지 적용합니다. 초기 점유는 수집 상태이며 미래 대기열을 복원하지 않습니다.</p>
         <p>선택 당시 예상 대기는 이미 도착한 차량을 포함한 가장 빠른 충전기 사용 가능 시각으로 계산합니다. 실제 대기는 도착순 FIFO 예약 후 계산합니다. 같은 정보와 변경 없는 대기열을 사용하는 이 모델에서는 두 값이 일치합니다. 기간 내 도착한 모든 신규 차량을 충전 완료까지 집계하며 초기 차량의 요금은 제외합니다.</p>
         <p>결과는 반복 1회당 평균입니다. 평균 대기의 표준오차(SE)는 반복 실험 간 변동이며 실세계 예측 오차가 아닙니다. 총 할인 혜택은 기본 단가 대비 할인액의 합으로 사업자 순손실과 다릅니다. 수입 차이는 정책별 선택 충전소와 단가로 계산한 단순 매출 차이이며 비용을 반영하지 않습니다.</p>
@@ -2537,7 +2687,39 @@ window.ESSMonitor.ready = detectServer();
   }
   $('sim-behavior-reference-content').innerHTML = behaviorReferenceHTML();
   function selected() { return [$('sim-a').value, $('sim-b').value].map(id => pool.find(s => s.id === id)); }
+  function timingKey() { return [$('sim-mode').value,$('sim-region').value,sourceWhen,...selected().map(s=>s?.id+':'+s?.speed)].join('|'); }
+  function showTiming() {
+    const active=$('sim-durationMode').value==='sessions',ready=sessionState?.key===timingKey();
+    const hasFallback=ready && sessionState.plan.stations.some(s=>sessionState.plan.pools[s.pool].level==='power');
+    $('sim-kind-duration').innerHTML=badge(active?(hasFallback?'추정·가정 혼합':'추정값'):'가정값');
+    $('sim-timing-load').disabled=busy || $('sim-mode').value!=='real';
+    if(!active) { $('sim-timing-status').textContent='선택한 가정 시간 모드를 사용합니다. 완료 기록 모드로 바꾸면 신규·초기 차량에 함께 적용합니다.';return; }
+    if(!ready) { $('sim-timing-status').textContent='실행 시 완료 기록 자동 조회 · 최근 30일, 충전소 5건 → 같은 지역·종류 5건 → 출력 기반 대체. 초기 잔여시간은 정상상태 추정이며 실측값이 아닙니다.';return; }
+    const p=sessionState.plan;
+    $('sim-timing-status').innerHTML=p.stations.map((s,i)=>{
+      const pool=p.pools[s.pool],a=window.ESSessionTiming.adjusted(pool,+$('sim-energy').value,selected()[i].kw);
+      return `<strong>${i?'B':'A'}</strong> · ${pool.level==='station'?'해당 충전소':pool.level==='region'?'지역·같은 종류로 대체':'표본 부족 → 출력 기반 가정'} ${pool.values.length}건<br>기록 평균 ${fmt(pool.mean)}분 → 적용 신규 평균 ${fmt(a.mean)}분 / 초기 잔여 기대 ${fmt(a.meanRemaining)}분<br>충전소 ${s.stationN}건 · 지역 ${s.regionN}건 · 최소 ${fmt(a.minMinutes)}분으로 연장하는 원표본 ${a.clipped}건`;
+    }).join('<br><br>')+`<br><br>초기 잔여는 정상상태 추정이며 실측값이 아닙니다. 긴 세션이 점유 중 관측되기 쉬워 잔여 기대가 신규 평균보다 길 수도 있습니다. 기준 ${escape(kst(p.asOf))}. <a href="${escape(p.source.repository)}" target="_blank" rel="noopener">원기록·고정 버전</a>. 분위수·정제·출처는 ‘입력값의 근거’에서 확인하세요.`;
+  }
+  async function ensureTiming(required=$('sim-durationMode').value==='sessions') {
+    if(!required) return;
+    if($('sim-mode').value!=='real') throw new Error('완료 기록 모드는 실제 공공데이터에서 사용하세요.');
+    const key=timingKey(),stations=selected().map(s=>({...s}));
+    const text=String(sourceWhen).replace(' ','T'),asOf=Date.parse(/(Z|[+-]\d\d:\d\d)$/.test(text)?text:text+'+09:00');
+    if(!Number.isFinite(asOf)) throw new Error('완료 기록의 기준으로 사용할 초기 상태 수집 시각이 없습니다. 실제 데이터를 다시 읽으세요.');
+    $('sim-timing-status').textContent='최근 완료 세션을 읽고 중복·비정상 기록을 정제하는 중입니다…';
+    try {
+      const plan=await timingClient.load(stations,$('sim-region').value,asOf);
+      if(key!==timingKey()) throw new Error('조회 중 조건이 변경됐습니다. 다시 불러오세요.');
+      sessionState={key,plan};showTiming();renderEvidence();
+    } catch(e) {
+      sessionState=null;
+      $('sim-timing-status').textContent=`충전시간 기록 조회 실패: ${e.message} 다시 시도하거나 출력 기반 모드를 직접 선택하세요.`;
+      throw e;
+    }
+  }
   function invalidate() {
+    showTiming();
     if (last) $('sim-export').disabled = true;
     for (const id of ['sim-report-export','sim-load-export']) $(id).disabled = true;
     if (last) $('sim-load-state').textContent = '조건이 변경되었습니다. 이전 실행 리포트입니다. 다시 실행하세요.';
@@ -2605,6 +2787,7 @@ window.ESSMonitor.ready = detectServer();
   }
   function cards() {
     updateBehavior();
+    showTiming();
     distance(); $('sim-source').textContent = source;
     $('sim-stations').innerHTML = selected().map((s, i) => !s ? '<p>선택할 충전소가 없습니다.</p>' : `<div class="sim-station"><strong>${i ? 'B' : 'A'} · ${escape(s.name)}</strong>${badge($('sim-mode').value === 'real' ? '실측·수집값' : '가정값')}
       <div class="sim-note">ID ${escape(s.id)} · ${s.speed === 'fast' ? '급속' : '완속'}<br>${fmt(s.lat, 5)}, ${fmt(s.lng, 5)}<br>
@@ -2632,6 +2815,8 @@ window.ESSMonitor.ready = detectServer();
     $('sim-run').disabled = true; $('sim-reload').disabled = true;
     try {
       const demo = $('sim-mode').value === 'demo', speed = $('sim-speed').value;
+      $('sim-durationMode').querySelector('option[value="sessions"]').disabled=demo;
+      if(demo && $('sim-durationMode').value==='sessions') $('sim-durationMode').value='power';
       $('sim-region').disabled = demo;
       if (demo) {
         source = '예시 데이터 · 실제 충전소가 아닙니다';
@@ -2663,6 +2848,7 @@ window.ESSMonitor.ready = detectServer();
     const o = Object.fromEntries(fields.map(([key]) => [key, +$('sim-' + key).value]));
     for (const k of ['discount', 'surcharge', 'threshold']) o[k] /= 100;
     o.durationMode = $('sim-durationMode').value;
+    if(sessionState?.key===timingKey()) o.sessionPlan=sessionState.plan;
     if ($('sim-distanceMode').value==='road') {
       try {if (roadState?.status==='ready' && roadState.key===routing.key(selected())) o.roadDistances=[...roadState.result.roadDistances];} catch { /* incomplete pair shown as missing */ }
     }
@@ -2693,6 +2879,7 @@ window.ESSMonitor.ready = detectServer();
     $('sim-run').disabled = active || pool.length < 2; $('sim-reload').disabled = active;
     $('sim-connect').disabled = active;
     $('sim-road-reload').disabled = active || $('sim-distanceMode').value!=='road';
+    $('sim-timing-load').disabled = active || $('sim-mode').value!=='real';
     $('sim-behavior-run').disabled = active || $('sim-speed').value !== 'fast' || pool.length < 2;
     if (!active) $('sim-region').disabled = $('sim-mode').value === 'demo';
   }
@@ -2755,11 +2942,11 @@ window.ESSMonitor.ready = detectServer();
     downloadFile('essential-forecast-format-example.json', JSON.stringify(payload,null,2), 'application/json;charset=utf-8');
   });
   const sweepLabel = key => key === 'durationMode' ? '충전시간 계산 방식' : fields.find(f => f[0] === key)[1];
-  const levelLabel = (key, value) => key === 'durationMode' ? value === 'power' ? '출력 기반' : '20~40분 가정' : fmt(policiesFields.has(key) ? value * 100 : value, 3).replace(/\.?0+$/, '');
+  const levelLabel = (key, value) => key === 'durationMode' ? value === 'sessions' ? '완료 기록 기반' : value === 'power' ? '출력 기반' : '20~40분 가정' : fmt(policiesFields.has(key) ? value * 100 : value, 3).replace(/\.?0+$/, '');
   function presetSweep() {
     invalidateSweep();
     const key = $('sim-sweep-key').value;
-    if (key === 'durationMode') { $('sim-sweep-values').value = 'assumed,power'; return; }
+    if (key === 'durationMode') { $('sim-sweep-values').value = $('sim-mode').value==='real' ? 'sessions,power' : 'assumed,power'; return; }
     const field = fields.find(f => f[0] === key), current = +$('sim-' + key).value;
     const vals = current === 0 ? [0, Math.max(field[3], policiesFields.has(key) ? 10 : 1), Math.max(field[3], policiesFields.has(key) ? 20 : 2)] : [.5, 1, 1.5].map(m => current * m);
     $('sim-sweep-values').value = [...new Set(vals.map(v => key === 'drivers' ? Math.round(v) : Number(v.toFixed(3))).map(v => Math.min(field[4], Math.max(field[3], v))))].join(',');
@@ -2778,7 +2965,7 @@ window.ESSMonitor.ready = detectServer();
       <div class="sim-table-wrap"><table class="sim-table"><caption>부하 민감도 · 15분 평균 부하의 반복별 피크 평균</caption><thead><tr><th>${escape(label)}</th><th>정책</th><th>A 피크 (kW)</th><th>B 피크 (kW)</th><th>합산 피크 (kW)</th><th>고정 대비 합산 저감률 (%)</th><th>기간 이후 충전량 (kWh)</th></tr></thead><tbody>${output.scenarios.map(s=>s.results.map(r=>`<tr><th>${escape(levelLabel(output.key,s.value))}</th><td>${r.label}</td><td>${fmt(r.load.stationPeakKw?.[0])}</td><td>${fmt(r.load.stationPeakKw?.[1])}</td><td>${fmt(r.load.combinedPeakKw)}</td><td>${fmt(r.load.combinedPeakReductionPct)}</td><td>${fmt(r.load.tailEnergyKwh)}</td></tr>`).join('')).join('')}</tbody></table></div>
       <p class="sim-note">저감률은 해당 수준의 고정요금 대비이며 양수는 감소, 음수는 증가입니다. 20~40분 가정의 등가 전력은 대표 출력을 넘을 수 있습니다. 부하 해석에는 출력 기반 모드를 권장합니다. 위 정책 순위 안내는 피크가 아닌 대기시간 기준입니다.</p>
       <div class="sim-charts">${sim.policies.map((label,p) => `<div><h4>${label} · 평균 대기</h4>${output.scenarios.map(s => `<div class="sim-bar-row"><div class="sim-bar-label"><span>${escape(levelLabel(output.key,s.value))}${s.value === output.baseline ? ' (현재값)' : ''}</span><b>${fmt(s.results[p].wait,2)}분</b></div><div class="sim-track"><div class="sim-fill sim-wait" style="width:${s.results[p].wait/maxWait*100}%"></div></div></div>`).join('')}</div>`).join('')}</div>
-      <p class="sim-note">각 수준의 ‘고정요금 대비’는 그 수준의 고정요금 정책과 비교합니다. ‘현재값 대비’는 현재 기준값에서의 같은 정책과 비교합니다. 동일 난수·초기 잔여시간을 공유하며 인원 변경 시 기존 운전자를 보존하고 추가 인원만 별도 난수로 생성합니다. 상호작용·실세계 예측오차는 분석하지 않습니다.</p>
+      <p class="sim-note">각 수준의 ‘고정요금 대비’는 그 수준의 고정요금 정책과 비교합니다. ‘현재값 대비’는 현재 기준값에서의 같은 정책과 비교합니다. 초기 점유와 난수를 공유하되 충전시간 방식·충전량을 바꾸면 잔여시간도 해당 규칙으로 재계산합니다. 인원 변경 시 기존 운전자를 보존하고 추가 인원만 별도 난수로 생성합니다. 상호작용·실세계 예측오차는 분석하지 않습니다.</p>
       <details><summary>이 분석의 기준 입력 근거</summary>${evidenceTable(output.evidence)}</details>
       <div class="sim-actions"><button type="button" id="sim-sweep-export">민감도 분석 CSV 다운로드</button></div>`;
     $('sim-sweep-export').addEventListener('click', exportSweep);
@@ -2811,7 +2998,7 @@ window.ESSMonitor.ready = detectServer();
       const key = $('sim-sweep-key').value, parts = $('sim-sweep-values').value.split(',').map(s=>s.trim());
       if (parts.some(s=>!s)) throw new Error('쉼표로 구분한 비교값을 입력하세요. 빈 값은 사용할 수 없습니다.');
       const values = key === 'durationMode' ? parts : parts.map(v => Number(v) / (policiesFields.has(key) ? 100 : 1));
-      const prediction = await preparePrediction(); await ensureRoad();
+      const prediction = await preparePrediction(); await ensureRoad(); await ensureTiming($('sim-durationMode').value==='sessions' || (key==='durationMode' && values.includes('sessions')));
       const capturedContext = context(prediction), capturedOptions = options(prediction);
       const currentStations = selected().map(s=>({...s}));
       if (lastSweep) $('sim-sweep-export').disabled = true;
@@ -2830,7 +3017,7 @@ window.ESSMonitor.ready = detectServer();
     lock(true); $('sim-progress').hidden = false;
     message('세 정책에 동일한 운전자를 적용해 계산하고 있습니다…');
     try {
-      const prediction = await preparePrediction(); await ensureRoad();
+      const prediction = await preparePrediction(); await ensureRoad(); await ensureTiming();
       const result = await sim.compare(selected(), options(prediction), p => { $('sim-progress').value = p; }, prediction?.utilizationById);
       result.context = context(prediction);
       result.evidence = sim.evidence(result.stations, result.options, result.context);
@@ -2847,7 +3034,7 @@ window.ESSMonitor.ready = detectServer();
     $('sim-behavior-export').disabled = true; $('sim-behavior-html').disabled = true;
     try {
       $('sim-behavior-status').textContent = '예측과 충전소 상태를 한 번 읽어 두 설정에 공유합니다…';
-      const prediction = await preparePrediction(); await ensureRoad(); const capturedContext = context(prediction);
+      const prediction = await preparePrediction(); await ensureRoad(); await ensureTiming(); const capturedContext = context(prediction);
       const output = await sim.compareBehavior(selected(), options(prediction), p => {$('sim-behavior-status').textContent=`행동계수 비교 중… ${Math.round(p*100)}%`;}, prediction?.utilizationById, ()=>cancelBehavior);
       output.context = {...capturedContext,behaviorPreset:'legacy vs literature'};
       for (const p of output.profiles) {
@@ -2902,7 +3089,7 @@ window.ESSMonitor.ready = detectServer();
     const time=value=>new Date(value).toLocaleTimeString('ko-KR',{timeZone:'Asia/Seoul',hour:'2-digit',minute:'2-digit'});
     $('sim-forecast-summary').innerHTML=`<p class="sim-note">실행 시각부터 남은 ${fmt(plan.minutes,2)}분 · 기대 신규 ${fmt(plan.expectedDrivers,3)}건. 실제 도착 인원 실측이 아닌 충전 시작 건수 추정으로, 반복마다 포아송 차량을 생성합니다. 지난 구간은 제외하고 일부 구간은 남은 시간 비율로 조정합니다. 요금은 각 구간의 이용률에 적용합니다.</p>
       <div class="sim-table-wrap"><table class="sim-table"><thead><tr><th>한국 시각</th><th>A 기대 건수</th><th>B 기대 건수</th><th>A / B 이용률</th></tr></thead><tbody>${plan.intervals.map(b=>`<tr><td>${time(b.startAt)}~${time(b.endAt)}${b.partial?' 일부':''}</td><td>${fmt(b.expected[0],3)}</td><td>${fmt(b.expected[1],3)}</td><td>${fmt(b.utilization[0]*100)} / ${fmt(b.utilization[1]*100)}%</td></tr>`).join('')}</tbody></table></div>
-      <p class="sim-note">초기 상태 수집: ${escape(kst(plan.observedAt))}. kWh·행동계수는 AI 모델에 없어 화면에서 선택한 별도 추정값 또는 사용자 가정을 유지합니다. 충전시간 통계는 참고만 하며 기본 출력 기반 계산을 유지합니다.</p>`;
+      <p class="sim-note">초기 상태 수집: ${escape(kst(plan.observedAt))}. kWh·행동계수는 AI 모델에 없어 화면에서 선택한 별도 추정값 또는 사용자 가정을 유지합니다. 완료 기록 모드를 선택하면 별도로 조회한 원기록 분포를 충전시간에 적용하며, 아래에서 표본과 대체 여부를 확인할 수 있습니다.</p>`;
   }
   function checkForecast() {
     invalidate();
@@ -2974,6 +3161,9 @@ window.ESSMonitor.ready = detectServer();
   $('sim-form').addEventListener('change', invalidate);
   $('sim-energySource').addEventListener('change', ()=>{updateEnergy();invalidate();});
   $('sim-energy').addEventListener('input', ()=>{$('sim-energySource').value='manual';updateEnergy();invalidate();});
+  $('sim-durationMode').addEventListener('change',()=>{showTiming();invalidate();});
+  $('sim-timing-load').addEventListener('click',async()=>{if(busy)return;lock(true);invalidate();try{await ensureTiming(true);}catch(e){message(e.message,true);}finally{lock(false);}});
+  $('sim-mode').addEventListener('change',()=>{if($('sim-mode').value==='real')$('sim-durationMode').value='sessions';});
   for (const id of ['mode', 'region', 'speed']) $('sim-' + id).addEventListener('change', ()=>{updateEnergy();load();});
   for (const id of ['a', 'b', 'distanceMode', 'threshold']) $('sim-' + id).addEventListener('change', ()=>{cards();if ($('sim-pricingBasis').value!=='observed') checkForecast();});
   $('sim-reload').addEventListener('click', load);

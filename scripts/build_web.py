@@ -46,7 +46,7 @@ def build() -> str:
             .replace("/*__PRICES__*/", price_txt)
             .replace("/*__SIM_CONFIG__*/", sim_config)
             .replace("/*__SIM_CSS__*/", (TEMPLATE.parent / "simulation.css").read_text(encoding="utf-8"))
-            .replace("/*__SIM_ENGINE__*/", (TEMPLATE.parent / "simulation.js").read_text(encoding="utf-8"))
+            .replace("/*__SIM_ENGINE__*/", (TEMPLATE.parent / "session-timing.js").read_text(encoding="utf-8") + "\n" + (TEMPLATE.parent / "simulation.js").read_text(encoding="utf-8"))
             .replace("/*__JEJU_ENERGY__*/null", (config.DATA_DIR / "jeju_energy_summary.json").read_text(encoding="utf-8").strip())
             .replace("/*__SIM_REPORT__*/", (TEMPLATE.parent / "simulation-report.js").read_text(encoding="utf-8"))
             .replace("/*__SIM_UI__*/", (TEMPLATE.parent / "routing.js").read_text(encoding="utf-8") + "\n" + (TEMPLATE.parent / "simulation-ui.js").read_text(encoding="utf-8")))
