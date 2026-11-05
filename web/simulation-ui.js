@@ -77,18 +77,18 @@
         <p id="sim-load-state" class="sim-note" role="status"></p><div id="sim-load-content"></div>
         <div class="sim-actions"><button type="button" id="sim-report-export">분석 리포트 HTML 다운로드</button><button type="button" id="sim-load-export">부하 시계열 CSV 다운로드</button></div>
       </section>
-      <section class="sim-card" id="sim-behavior-panel" aria-label="행동계수 설정 비교">
-        <h3>04 · 기존 예시값과 팀 채택 기준 비교</h3>
-        <p>네 행동계수를 묶음으로 바꿔 2개 설정 × 3개 요금 정책을 비교합니다. 현재 A/B와 나머지 입력을 사용합니다. 선택한 행동계수는 일반 ‘시뮬레이션 실행’에 적용됩니다.</p>
+      <details class="sim-card" id="sim-behavior-panel">
+        <summary>04 · 기존 예시값과 팀 채택 기준 비교 (선택)</summary>
+        <p>일반 실행은 위에서 선택한 행동계수만 사용합니다. 이 비교를 실행하면 같은 A/B·수요·난수에서 기존 예시값과 팀 기준을 각각 세 요금 정책에 적용해, 계수 묶음에 따라 결과가 달라지는지 확인할 수 있습니다.</p>
         <details id="sim-behavior-reference"><summary>논문 출처와 환산 가정</summary><div id="sim-behavior-reference-content"></div></details>
         <div class="sim-actions"><button type="button" id="sim-behavior-run" class="sim-primary">기존값 · 팀 채택 기준 함께 비교</button><button type="button" id="sim-behavior-cancel" hidden>비교 중단</button></div>
         <p class="sim-status" role="status" id="sim-behavior-status">같은 종류의 충전소 A/B를 선택해 비교하세요.</p>
         <div id="sim-behavior-results"></div>
         <div class="sim-actions"><button type="button" id="sim-behavior-export" disabled>계수 비교 CSV 다운로드</button><button type="button" id="sim-behavior-html" disabled>계수 비교 HTML 리포트</button></div>
-      </section>
+      </details>
       <section class="sim-card" id="sim-sweep-panel" aria-label="민감도 분석">
-        <h3>05 · 가정값을 바꿔 보는 민감도 분석</h3>
-        <p class="sim-note">현재 A/B와 조건을 고정하고 한 항목만 바꿉니다. 실측 보정이나 최적 정책 인증이 아닌 시나리오 비교입니다. 현재 기준값은 자동 포함합니다.</p>
+        <h3>05 · 요금 정책과 가정값 민감도 분석</h3>
+        <p class="sim-note">할인율 10/20/30%처럼 여러 수준을 비교할 때 사용합니다. 한 분석 안에서 A/B·예측 수요·난수를 공유하고 선택한 항목만 바꿉니다. 현재 기준값은 자동 포함합니다. 일반 실행과는 별도의 선택 기능입니다.</p>
         <fieldset id="sim-sweep-controls" class="sim-fields" style="border:0;padding:0;margin:0;min-width:0">
           <label>비교할 항목<select id="sim-sweep-key">${sweepFields.map(([key,label]) => `<option value="${key}">${label}</option>`).join('')}<option value="durationMode">충전시간 계산 방식</option></select></label>
           <label>비교할 값 (쉼표로 구분)<input type="text" id="sim-sweep-values" value="12,24,36"></label>
