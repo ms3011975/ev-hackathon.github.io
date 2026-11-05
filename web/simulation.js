@@ -10,9 +10,10 @@
   const behaviorKeys = ['sensitivity', 'alpha', 'beta', 'tau'];
   const behaviorProfiles = {
     legacy: { id: 'legacy', label: '기존 예시값', values: { sensitivity: 1, alpha: 600, beta: 300, tau: 2000 } },
-    literature: { id: 'literature', label: '팀 채택 문헌 기준 (급속)', values: { sensitivity: 1, alpha: 950, beta: 360, tau: 7200 } }
+    literature: { id: 'literature', scope: 'fast', label: '팀 채택 문헌 기준 (급속)', values: { sensitivity: 1, alpha: 950, beta: 360, tau: 7200 } },
+    slowLiterature: { id: 'slowLiterature', scope: 'slow', label: '팀 채택 문헌 참고 기준 (완속·잠정)', values: { sensitivity: 1, alpha: 510, beta: 220, tau: 10000 } }
   };
-  const behaviorDefault = speed => behaviorProfiles[speed === 'slow' ? 'legacy' : 'literature'];
+  const behaviorDefault = speed => behaviorProfiles[speed === 'slow' ? 'slowLiterature' : 'literature'];
   const behaviorAdoption = { version:'team-2026-11-05-v1',date:'2026-11-05',scope:'fast',
     rationale:'팀이 Dong et al.(2024) 환산값을 급속 기준 시나리오로 채택. s=1 정규화, 같은 τ 기준으로 α·β 환산. 충북 실측 검증 완료나 기존 예시보다 높은 정확도를 의미하지 않음',
     limitations:['캘리포니아 장거리 공공 급속 연구로 충북 근거리·완속에 직접 일반화할 수 없음',
@@ -30,7 +31,32 @@
     income: '원문 평균소득 기준 유지. 한국 소득·구매력 보정 없음',
     limitation: '국외 문헌 이전 적용 추정값. 충북 실측 보정 전. 통화 환산·전비·속도는 시나리오 가정이며 현재 환율·실측 교통속도가 아님. 충전시간·편의시설·대기 발생 여부 항은 같다고 놓은 축약 변환. 원문 모형 전체의 재현 아님.'
   };
-  function behaviorConversion() {
+  const behaviorReferenceSlow = {
+    version:'slow-multi-source-transfer-v1', valueOfTime:15205, detourKmh:30, occupants:1,
+    waitMedianDollars:9.44, waitMeanDollars:2.93, wonPerDollar:1400, costPerPound:.169, wonPerPound:1700,
+    alpha:{title:'한국교통연구원 (2024), 2024년 국가교통조사 및 분석 — 교통분석용 네트워크 구축',
+      url:'https://www.ktdb.go.kr/DATA/pblcte/20250805092141083.pdf', pages:'본문 122쪽 표 5-15 (PDF 172쪽)',
+      basis:'2023년 승용차 비업무 통행시간 가치 15,205원/인·시간. 운전자 1명·30km/h 가정. 차량 운행비용은 별도로 더하지 않음'},
+    beta:{title:'Moras 외 (2024), Electric Vehicles: Public Perceptions, Expectations, and Willingness-to-Pay',
+      url:'https://doi.org/10.5703/1288284317766', pages:'표 4.3 · EV Users · Waiting Time (Level 2)',
+      basis:'미국 인디애나 조사 실제 EV 이용자 집단의 대기시간 감소 WTP 중앙값 9.44USD/시간. 평균은 2.93USD/시간으로 다름. 1USD=1,400원 고정 환산'},
+    tau:{title:'Budnitz, Meelen & Schwanen (2024), Public residential charging of electric vehicles: An exploration of UK user preferences',
+      url:'https://doi.org/10.1016/j.ets.2024.100004', pages:'표 4 Model 1A · Cost −0.169/GBP',
+      basis:'영국 운전자 2,001명 대상 주거지 인근 야간 1회 충전요금 선택실험. 1GBP=1,700원 고정 환산. 실제 EV 충전 미경험 응답자 다수'}
+  };
+  const behaviorAdoptions = { literature:behaviorAdoption, slowLiterature:{version:'team-2026-11-05-slow-v1',date:'2026-11-05',scope:'slow',
+    rationale:'팀 제공 완속 기준 s=1, α=510, β=220, τ=10000을 문헌 참고 잠정 시나리오로 채택. 서로 다른 연구의 대리값 조합이며 단일 선택모형의 공동 추정값이 아님',
+    limitations:['국내 일반 비업무 통행시간 가치를 완속 추가 운전거리 부담으로 이전. 1명·30km/h 가정이며 실측 우회 선호·차량 운행비용을 반영하지 못함',
+      '미국 Level 2 대기 WTP 중앙값을 이전. 평균 2.93USD/시간과 차이가 있어 전체 이용자의 대표값으로 단정할 수 없음',
+      '영국 주거지 야간 1회 요금의 가격계수를 이전. 실제 충전 미경험 응답자가 많고 충북 kWh 요금·A/B 선택과 상황이 다름',
+      '서로 다른 연구의 계수를 조합한 대리값. 계수 간 관계·충북 행동 적합성·정확도 우위는 검증되지 않았으며 기존값과 민감도 비교 필요'] }};
+  const policyComparisons = {discount:[.1,.2,.3],surcharge:[0,.15,.3],threshold:[.3,.5,.7]};
+  function behaviorConversion(speed = 'fast') {
+    if(speed === 'slow') {
+      const b=behaviorReferenceSlow;
+      return {alpha:b.valueOfTime*b.occupants/b.detourKmh, beta:b.waitMedianDollars*b.wonPerDollar/60,
+        betaMean:b.waitMeanDollars*b.wonPerDollar/60, tau:b.wonPerPound/b.costPerPound};
+    }
     const b = behaviorReference, r = b.energyKwh * b.efficiencyKmPerKwh / 160.9344;
     const tau = b.wonPerDollar * r ** (1 - b.rangeElasticity) / b.cost;
     return { r, tau, alpha: b.detour * tau * 60 / b.detourKmh, beta: b.wait * tau };
@@ -38,7 +64,7 @@
   function behaviorMatch(o, context = {}) {
     const preset = behaviorProfiles[context.behaviorPreset];
     return preset && behaviorKeys.every(k => o[k] === preset.values[k]) &&
-      (preset.id !== 'literature' || context.speed === 'fast') ? preset.id : 'custom';
+      (!preset.scope || context.speed === preset.scope) ? preset.id : 'custom';
   }
   const policies = ['고정요금', '할인·할증', '할인 전용'];
   const defaults = { drivers: 24, minutes: 60, energy: energyDefault('fast'), discount: .2, surcharge: .15,
@@ -300,7 +326,7 @@
     });
     const queues = stations.map((s, i) => [...Array(s.avail).fill(0),...initial[i].map(v=>typeof v==='number'?v:v.remaining)]);
     const records = [], count = [0, 0];
-    let wait = 0, estimated = 0, charge = 0, distance = 0, discount = 0, completion = 0;
+    let wait = 0, estimated = 0, charge = 0, distance = 0, discount = 0, completion = 0, discountedCount = 0, surchargedCount = 0;
     for (const d of people.drivers) {
       const quote = priceSchedule ? priceSchedule.find(b=>d.arrival>=b.start && d.arrival<b.end)?.prices : prices;
       if (!quote) throw new Error('도착 시각에 대응하는 예측 요금 구간이 없습니다.');
@@ -316,6 +342,7 @@
       q[slot] = end; count[i]++; wait += actual; estimated += expected[i];
       charge += o.energy * quote[i]; distance += diversionDistance(origin,i,o);
       discount += o.energy * Math.max(0, stations[i].base - quote[i]); completion = Math.max(completion, end);
+      discountedCount += Number(quote[i] < stations[i].base); surchargedCount += Number(quote[i] > stations[i].base);
       let observedDuration=null;
       if (o.durationMode==='sessions') { const pool=o.sessionPlan.pools[o.sessionPlan.stations[i].pool]; if(pool.values.length) observedDuration=timing.sample(pool,(d.duration-20)/20); }
       records.push({ driver: d.id, origin, station: i, price:quote[i], extraDistance:diversionDistance(origin,i,o), arrival: d.arrival, expectedWait: expected[i], actualWait: actual, start, end,
@@ -324,11 +351,11 @@
     const n = people.drivers.length, denominator = n || 1;
     return { policy, prices, priceSchedule, drivers:n, count, share: count.map(v => v / denominator), wait: wait / denominator,
       expectedWait: estimated / denominator, fee: charge / denominator, distance: distance / denominator,
-      discount, revenue: charge, completion, records, load: loadProfile(stations, o, initial, records) };
+      discount, discountedCount, surchargedCount, revenue: charge, completion, records, load: loadProfile(stations, o, initial, records) };
   }
   async function compare(stations, options = {}, onProgress = () => {}, utilizationById, control = {}) {
     const o = { ...defaults, ...behaviorDefault(stations[0]?.speed).values, energy: energyDefault(stations[0]?.speed), ...options }; validate(stations, o);
-    const random = rng(o.seed), results = policies.map((label, policy) => ({ label, policy, count: [0, 0], share: [0, 0], wait: 0, expectedWait: 0, fee: 0, distance: 0, discount: 0, revenue: 0, completion: 0, samples: [] }));
+    const random = rng(o.seed), results = policies.map((label, policy) => ({ label, policy, count: [0, 0], share: [0, 0], wait: 0, expectedWait: 0, fee: 0, distance: 0, discount: 0, discountedCount:0, surchargedCount:0, revenue: 0, completion: 0, samples: [] }));
     const populationCounts = [];
     const peakSamples = policies.map(() => []), peakDeltaSamples = policies.map(() => []);
     for (let r = 0; r < o.repeats; r++) {
@@ -339,7 +366,7 @@
       for (let p = 0; p < 3; p++) {
         const run = runPolicy(stations, o, people, p, utilizationById), out = results[p];
         for (const key of ['wait', 'expectedWait', 'fee', 'distance']) out[key] += run[key] * run.drivers;
-        for (const key of ['discount', 'revenue', 'completion']) out[key] += run[key] / o.repeats;
+        for (const key of ['discount', 'discountedCount', 'surchargedCount', 'revenue', 'completion']) out[key] += run[key] / o.repeats;
         for (let i = 0; i < 2; i++) { out.count[i] += run.count[i] / o.repeats; out.share[i] += run.share[i] / o.repeats; }
         out.samples.push({n:run.drivers,wait:run.wait}); out.prices = run.prices; out.priceSchedule = run.priceSchedule;
         const l = run.load;
@@ -393,8 +420,8 @@
       population: {expected:o.drivers,mean:meanDrivers,min:Math.min(...populationCounts),max:Math.max(...populationCounts),emptyRuns:populationCounts.filter(n=>!n).length} };
   }
   async function compareBehavior(stations, options = {}, onProgress = () => {}, utilizationById, cancelled = () => false) {
-    if (stations.length !== 2 || stations.some(s => s.speed !== 'fast')) throw new Error('팀 채택 문헌 기준 비교는 급속 충전소 2곳에서 지원합니다. 완속 행동은 별도 보정이 필요합니다.');
-    const base = { ...defaults, ...options }; validate(stations, base);
+    if (stations.length !== 2 || !['fast','slow'].includes(stations[0]?.speed) || stations.some(s => s.speed !== stations[0].speed)) throw new Error('같은 종류의 급속 또는 완속 충전소 2곳을 선택하세요.');
+    const base = { ...defaults, ...behaviorDefault(stations[0].speed).values, energy:energyDefault(stations[0].speed), ...options }; validate(stations, base);
     const upper = base.forecastPlan ? Math.min(2000, Math.ceil(base.drivers + 8 * Math.sqrt(base.drivers) + 10)) : base.drivers;
     if (2 * base.repeats * upper * 3 > 2000000) throw new Error('분석량이 큽니다. 인원 또는 반복 횟수를 줄여 주세요 (최대 200만 차량·정책 계산).');
     const random = rng(base.seed), populations = [];
@@ -403,7 +430,7 @@
       populations.push(population(stations, base, random));
     }
     const profiles = [];
-    for (const [i, preset] of Object.values(behaviorProfiles).entries()) {
+    for (const [i, preset] of [behaviorProfiles.legacy, behaviorDefault(stations[0].speed)].entries()) {
       const result = await compare(stations, { ...base, ...preset.values }, p => onProgress((i + p) / 2), utilizationById, { populations, cancelled });
       profiles.push({ id: preset.id, label: preset.label, ...result });
     }
@@ -448,15 +475,24 @@
   function evidence(stations, o, context = {}) {
     const rows = [], add = (item, value, kind, basis) => rows.push({ item, value, kind, basis });
     const real = context.mode === 'real';
-    const behavior = behaviorMatch(o, context), literature = behavior === 'literature';
+    const behavior = behaviorMatch(o, context), literature = Boolean(behaviorAdoptions[behavior]), adoption=behaviorAdoptions[behavior];
     add('행동계수 설정', behaviorProfiles[behavior]?.label || '사용자 가정값', literature ? '추정값' : '가정값',
-      literature ? '팀 채택 급속 기준: s=1, α=950, β=360, τ=7200. 급속 14.82kWh 기준 환산을 반올림. 충전량을 바꿔도 계수는 자동 재산정하지 않음' : '실측 행동 보정 전. 수치를 수정하거나 완속에 이전하면 사용자 가정값으로 취급');
+      literature ? `${adoption.rationale}. 충전량·도로 거리를 바꿔도 계수는 자동 재산정하지 않음` : '실측 행동 보정 전. 수치 수정 또는 다른 충전 유형에 이전하면 사용자 가정값으로 취급');
     if (literature) {
-      add('행동계수 팀 채택',`${behaviorAdoption.date} · ${behaviorAdoption.version}`,'실험 설정',behaviorAdoption.rationale);
-      add('행동계수 적용 한계',behaviorAdoption.limitations.join(' / '),'추정값','팀 채택은 급속 기준 시나리오 선정이며 지역 검증·정확도 우위·최적값 확정을 의미하지 않음');
+      add('행동계수 팀 채택',`${adoption.date} · ${adoption.version}`,'실험 설정',adoption.rationale);
+      add('행동계수 적용 한계',adoption.limitations.join(' / '),'추정값','팀 채택은 기준 시나리오 선정이며 지역 검증·정확도 우위·최적값 확정을 의미하지 않음');
+    }
+    if (behavior === 'literature') {
       add('행동계수 문헌', behaviorReference.title, '추정값', `${behaviorReference.population} · ${behaviorReference.pages} · ${behaviorReference.url}`);
       add('행동계수 환산 가정', '14.82kWh · 6km/kWh · 1,400원/USD · 30km/h · s=1 정규화', '실험 설정',
         `r=14.82×6÷160.9344; τ=1400×r^(1−0.35168)÷0.132; α=0.066×τ×60÷30; β=0.050×τ. 반올림 전 ${JSON.stringify(behaviorConversion())}. ${behaviorReference.income}. ${behaviorReference.limitation} 현재 입력 충전량 ${o.energy}kWh.`);
+    }
+    if (behavior === 'slowLiterature') {
+      for (const [key,label] of [['alpha','이동 비용 α'],['beta','대기 비용 β'],['tau','선택 다양성 τ']]) {
+        const b=behaviorReferenceSlow[key]; add(`행동계수 문헌 · ${label}`,b.title,'추정값',`${b.pages} · ${b.basis} · ${b.url}`);
+      }
+      add('행동계수 환산 가정','15,205원/인·시간 · 1명 · 30km/h · 1,400원/USD · 1,700원/GBP · s=1 정규화','실험 설정',
+        `α=15205÷30; β=9.44×1400÷60 (평균 WTP 비교:2.93×1400÷60); τ=1700÷0.169. 반올림 전 ${JSON.stringify(behaviorConversion('slow'))}. 환율·속도는 고정 가정이며 현행 실측값이 아님. τ는 1회 요금 계수로 환산하므로 충전량을 다시 곱하지 않음. 다른 연구 조합·정규화로 현재 A/B 모형에 근사 이전. 충전량 변경 시에도 고정.`);
     }
     for (const [i, s] of stations.entries()) {
       const prefix = i ? 'B' : 'A';
@@ -483,7 +519,7 @@
       add(label, `${o[key]}${unit}`, derived ? '추정값' : '가정값', derived ? 'v2 남은 구간의 충전 시작 건수 추정. 실제 도착·대기·포기 차량을 관측한 값 아님' : key==='energy' ? '공공 API에 kWh 없음. 사용자 가정값이며 예측 건수·충전시간으로 역산하지 않음' : '요구사항 예시를 초기값으로 사용. 변경값은 사용자 시나리오이며 실측·통계 보정 전');
     }
     for (const [key, label] of [['discount','여유 할인율'],['surcharge','혼잡 할증율'],['threshold','여유 판정 대기율']])
-      add(label, `${o[key] * 100}%`, '정책 설정', '기존 프로젝트 기본 정책에서 시작. 정책 효과를 검증한 최적값이 아님');
+      add(label, `${o[key] * 100}%`, '정책 설정', `기본 정책에서 시작. 팀 비교 수준 ${policyComparisons[key].map(v=>Number((v*100).toFixed(3))).join('/')}%. 최적값·신뢰구간이 아님. 같은 상태·수요에서 대기·분산·A/B/합산 피크·요금·단순 매출을 함께 평가`);
     if (context.distanceMode === 'road' && o.roadDistances) {
       add('대체 충전소 도로 거리', `A→B ${o.roadDistances[0]}km / B→A ${o.roadDistances[1]}km`, '추정값',
         `${context.roadRoute?.provider || 'OSRM car'} · 조회 ${context.roadRoute?.fetchedAt || '기록 없음'} · ${context.roadRoute?.url || ''}. OSM 도로 연결점 기준 최단시간 경로 거리. 실시간 교통·GPS 실측 아님. 도로 연결 오차 ${JSON.stringify(context.roadRoute?.snapMeters || [])}m. 원래 선택지에서는 0km, 변경 방향에 맞는 거리를 적용. 이동시간은 도착 시각에 더하지 않음. 차량 출발지·최종 목적지가 없어 실제 우회거리로 대체하는 가정이 남음.`);
@@ -520,5 +556,5 @@
     }
     return rows;
   }
-  return { defaults, energyProfile, energyDefault, behaviorProfiles, behaviorDefault, behaviorAdoption, behaviorReference, behaviorKeys, behaviorConversion, behaviorMatch, compareBehavior, policies, demo, rng, status, price, probability, validate, population, runPolicy, diversionDistance, loadProfile, compare, forecast, forecastV2, poisson, sweep, sweepKeys, evidence };
+  return { defaults, energyProfile, energyDefault, behaviorProfiles, behaviorDefault, behaviorAdoption, behaviorAdoptions, behaviorReference, behaviorReferenceSlow, behaviorKeys, behaviorConversion, behaviorMatch, compareBehavior, policies, policyComparisons, demo, rng, status, price, probability, validate, population, runPolicy, diversionDistance, loadProfile, compare, forecast, forecastV2, poisson, sweep, sweepKeys, evidence };
 });

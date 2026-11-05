@@ -82,6 +82,7 @@ test('v2 uses arrival-bin quotes and origin-specific diversion distance',()=>{
   const people={initial:[[],[]],drivers:[{id:0,origin:0,arrival:0,duration:20,choice:0},{id:1,origin:0,arrival:20,duration:20,choice:0}]};
   const r=sim.runPolicy(stations,options(p,{sensitivity:0,alpha:0,beta:0}),people,1,p.utilizationById);
   assert.deepEqual(r.records.map(x=>x.price),[277.8,399.3]);
+  assert.equal(r.discountedCount,1);assert.equal(r.surchargedCount,1);
   assert.ok(Math.abs(r.revenue-(277.8+399.3)*sim.defaults.energy)<1e-8);
   const own=sim.runPolicy(stations,options(p,{sensitivity:0,alpha:100000,beta:0,tau:1}),
     {initial:[[],[]],drivers:[{id:0,origin:1,arrival:0,duration:20,choice:.5}]},0,p.utilizationById);

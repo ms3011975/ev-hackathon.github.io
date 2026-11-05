@@ -4,7 +4,7 @@
   const routing = window.ESSRouting, roadClient = routing.createClient((url, opts)=>fetch(url, opts));
   let roadState = null, roadTimer;
   const timingClient=window.ESSessionTiming.createClient((url,opts)=>fetch(url,opts));
-  let sessionState=null, behaviorAutoFallback=false;
+  let sessionState=null;
   let forecastLoading=false,forecastFailure='';
   const $ = id => document.getElementById(id), escape = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
   const fmt = (n, d = 1) => Number.isFinite(n) ? n.toLocaleString('ko-KR', { minimumFractionDigits: d, maximumFractionDigits: d }) : '—';
@@ -37,7 +37,7 @@
         <label class="sim-wide">충전소 B<select id="sim-b" required></select></label>
         <label class="sim-wide">충전량 입력 근거<select id="sim-energySource"><option value="jeju">팀 채택 제주 추정값 · 급속/완속 자동 적용</option><option value="manual">사용자 가정값 · 직접 입력</option></select></label>
         <p class="sim-wide sim-note" id="sim-energy-note"></p>
-        <label class="sim-wide">운전자 행동계수 설정<select id="sim-behaviorPreset"><option value="legacy">기존 예시값 · 1 / 600 / 300 / 2000</option><option value="literature" selected>팀 채택 문헌 기준 · 1 / 950 / 360 / 7200 (급속)</option><option value="custom">사용자 가정값 · 직접 입력</option></select></label>
+        <label class="sim-wide">운전자 행동계수 설정<select id="sim-behaviorPreset"><option value="legacy">기존 예시값 · 1 / 600 / 300 / 2000</option><option value="literature" selected>팀 채택 문헌 기준 · 1 / 950 / 360 / 7200 (급속)</option><option value="slowLiterature">팀 채택 문헌 참고 · 1 / 510 / 220 / 10000 (완속·잠정)</option><option value="custom">사용자 가정값 · 직접 입력</option></select></label>
         <p class="sim-wide sim-note" id="sim-behavior-note"></p>
         ${fields.map(([id, label, value, min, max, step]) => `<label>${label}<span id="sim-kind-${id}">${badge(id === 'distance' ? '추정값' : fieldKind(id))}</span><input id="sim-${id}" type="number" value="${value}" min="${min}" max="${max}" step="${step}" required></label>`).join('')}
         <label class="sim-wide">추가 거리 산정<select id="sim-distanceMode"><option value="road">자동차 도로 이동거리 · 방향별 자동 조회</option><option value="manual">사용자 입력 거리 · 양방향 동일 가정</option></select></label>
@@ -60,7 +60,7 @@
       </div></fieldset>
       <div class="sim-actions"><button class="sim-primary" id="sim-run" type="submit">시뮬레이션 실행</button><button id="sim-connect" type="button">AI 수요 모델 연결</button><button id="sim-reload" type="button">데이터 새로 읽기</button></div>
       <p id="sim-connection-status" class="sim-status" role="status" aria-live="polite" hidden></p>
-      <p class="sim-note">가격 민감도 1배에서 C = E×P + α×D + β×W. 민감도는 E×P 항에 곱합니다. 행동계수는 기존·사용자 가정 또는 2026-11-05 팀이 급속 기준 시나리오로 채택했습니다. 국외 이전 추정이며 충북 실측 보정·정확도 우위 검증 전입니다. 시간대 배수는 적용하지 않습니다.</p>
+      <p class="sim-note">가격 민감도 1배에서 C = E×P + α×D + β×W. 민감도는 E×P 항에 곱합니다. 행동계수는 기존·사용자 가정 또는 종류별 팀 채택 기준입니다. 완속은 여러 연구를 조합한 잠정 대리값입니다. 충북 실측 보정·정확도 우위 검증 전이며 시간대 배수는 적용하지 않습니다.</p>
     </form><div>
       <div class="sim-card"><h3>02 · 비교할 두 충전소</h3><span class="sim-badge" id="sim-source"></span><div id="sim-message" class="sim-status" role="status" aria-live="polite"></div><div id="sim-stations" class="sim-stations"></div></div>
       <details class="sim-card" id="sim-evidence-box"><summary>입력값의 근거 · 실측값 / 추정값 / 가정값</summary><p class="sim-note">실측·수집값은 수집 시각의 기록입니다. 추정값은 계산·대체 단가·대표 출력·외부 예측을 뜻하며 통계 보정을 완료했다는 뜻은 아닙니다. 가정값은 검증 전 시나리오입니다. 공시요금·정책·반복 설정도 별도로 구분합니다.</p><div id="sim-evidence"></div></details>
@@ -82,7 +82,7 @@
         <p>네 행동계수를 묶음으로 바꿔 2개 설정 × 3개 요금 정책을 비교합니다. 현재 A/B와 나머지 입력을 사용합니다. 선택한 행동계수는 일반 ‘시뮬레이션 실행’에 적용됩니다.</p>
         <details id="sim-behavior-reference"><summary>논문 출처와 환산 가정</summary><div id="sim-behavior-reference-content"></div></details>
         <div class="sim-actions"><button type="button" id="sim-behavior-run" class="sim-primary">기존값 · 팀 채택 기준 함께 비교</button><button type="button" id="sim-behavior-cancel" hidden>비교 중단</button></div>
-        <p class="sim-status" role="status" id="sim-behavior-status">급속 충전소 A/B를 선택해 비교하세요.</p>
+        <p class="sim-status" role="status" id="sim-behavior-status">같은 종류의 충전소 A/B를 선택해 비교하세요.</p>
         <div id="sim-behavior-results"></div>
         <div class="sim-actions"><button type="button" id="sim-behavior-export" disabled>계수 비교 CSV 다운로드</button><button type="button" id="sim-behavior-html" disabled>계수 비교 HTML 리포트</button></div>
       </section>
@@ -92,11 +92,12 @@
         <fieldset id="sim-sweep-controls" class="sim-fields" style="border:0;padding:0;margin:0;min-width:0">
           <label>비교할 항목<select id="sim-sweep-key">${sweepFields.map(([key,label]) => `<option value="${key}">${label}</option>`).join('')}<option value="durationMode">충전시간 계산 방식</option></select></label>
           <label>비교할 값 (쉼표로 구분)<input type="text" id="sim-sweep-values" value="12,24,36"></label>
-          <button id="sim-sweep-preset" type="button">현재값의 0.5 / 1 / 1.5배 넣기</button>
+          <button id="sim-sweep-preset" type="button">추천 비교값 넣기</button>
           <button id="sim-sweep-run" type="button" class="sim-primary">민감도 분석 실행</button>
         </fieldset>
         <button id="sim-sweep-cancel" type="button" hidden>분석 중단</button>
-        <p class="sim-note">비교값은 최대 8개입니다. 정책 비율은 화면과 동일한 % 단위입니다. 거리 변경은 사용자 가정 시나리오로 취급합니다. 충전시간 방식은 sessions(완료 기록), power(출력 기반), assumed(20~40분)입니다. 제안값은 검증된 현실 범위가 아닙니다.</p>
+        <p class="sim-note">팀 정책 비교 수준: 할인 10/20/30%, 할증 0/15/30%, 여유 판정 빈 비율 30/50/70%. 추천 버튼은 정책 항목에 이 값을 넣고 다른 숫자는 현재값의 0.5/1/1.5배를 제안합니다. 비교값은 최대 8개이며 최적값·신뢰구간이 아닙니다. 거리 변경은 양방향 동일 사용자 가정, 시간 방식은 sessions(완료 기록), power(출력 기반), assumed(20~40분)입니다.</p>
+        <p class="sim-note">A/B의 접근성·충전기 수·수요 규모·자료 시각을 확인하세요. A·B·동시 A+B 피크와 대기·충전요금·단순 매출을 함께 비교합니다. 할인 적용 건수는 모의 신규 세션 기준이며 전체 지역 할인 대상 충전소 수를 뜻하지 않습니다. 반복 100회·시드 42에서 시작하고 다른 시드에서도 결론을 확인하세요.</p>
         <p id="sim-sweep-status" class="sim-status" role="status" aria-live="polite">항목과 비교값을 확인한 뒤 실행하세요.</p>
         <div id="sim-sweep-results"></div>
       </section>
@@ -118,21 +119,30 @@
   }
   function updateBehavior(apply = false) {
     const speed = $('sim-speed').value, select = $('sim-behaviorPreset');
-    select.querySelector('option[value="literature"]').disabled = speed !== 'fast';
-    let movedToSlow = false;
-    if (select.value === 'literature' && speed !== 'fast') { select.value = 'legacy'; movedToSlow = true;behaviorAutoFallback=true;apply=true; }
-    else if(speed==='fast' && behaviorAutoFallback){select.value='literature';behaviorAutoFallback=false;apply=true;}
+    for (const p of Object.values(sim.behaviorProfiles)) if(p.scope) select.querySelector(`option[value="${p.id}"]`).disabled = p.scope !== speed;
+    if(sim.behaviorProfiles[select.value]?.scope && sim.behaviorProfiles[select.value].scope !== speed) {
+      select.value=sim.behaviorDefault(speed).id;apply=true;
+    }
     const preset = sim.behaviorProfiles[select.value];
     if (apply && preset) for (const key of sim.behaviorKeys) $('sim-'+key).value = preset.values[key];
-    const literature = sim.behaviorMatch(options(), { behaviorPreset: select.value, speed }) === 'literature';
+    const matched=sim.behaviorMatch(options(), { behaviorPreset: select.value, speed }), adoption=sim.behaviorAdoptions[matched], literature=Boolean(adoption);
     for (const key of sim.behaviorKeys) $('sim-kind-'+key).innerHTML = badge(literature ? key === 'sensitivity' ? '실험 설정' : '추정값' : '가정값');
-    $('sim-behavior-note').textContent = (movedToSlow ? '급속 문헌 기준은 완속에 적용하지 않아 완속 예시 가정값으로 전환했습니다. ' : '') + (literature
-      ? '팀 채택 문헌 기준: 급속 14.82kWh 참조, s=1 정규화 · α=950 · β=360 · τ=7200. 2026-11-05 팀이 급속 기준 시나리오로 채택했습니다. 국외 이전 추정이며 충북 실측 보정·정확도 우위 검증 전입니다. 충전량 변경 시에도 이 계수는 고정됩니다. 아래 04에서 출처·가정을 확인하고 두 설정을 비교하세요.'
-      : select.value === 'legacy' ? (speed==='slow'?'완속은 별도 예시 가정 1/600/300/2000을 사용합니다. 급속 문헌 채택과 구분하며 국내 완속 보정 전입니다.':'비교용 초기 예시값입니다. 팀 채택 급속 기준은 1/950/360/7200이며, 초기값을 다시 선택한 가정 시나리오입니다.') : '직접 수정한 네 계수는 사용자 가정값입니다. 문헌 기준 숫자와 같아도 사용자 선택으로 구분합니다.');
-    $('sim-behavior-run').disabled = busy || speed !== 'fast' || pool.length < 2;
-    if (speed !== 'fast') $('sim-behavior-status').textContent = '문헌 기준은 장거리 급속 연구 기반이므로 완속 비교를 지원하지 않습니다. 완속은 사용자 가정값으로 일반 실행할 수 있습니다.';
+    $('sim-behavior-note').textContent = literature
+      ? `${preset.label}: s=${preset.values.sensitivity} 정규화 · α=${preset.values.alpha} · β=${preset.values.beta} · τ=${preset.values.tau}. ${adoption.rationale}. 충북 실측 보정·정확도 우위 검증 전입니다. 충전량·도로 거리 변경 시에도 계수는 고정됩니다. 아래 04에서 출처·환산 가정을 확인하세요.`
+      : select.value === 'legacy' ? '비교용 초기 예시값 1/600/300/2000입니다. 현재 종류의 팀 채택 기준과 구분합니다.' : '직접 수정한 네 계수는 사용자 가정값입니다. 문헌 기준 숫자와 같아도 사용자 선택으로 구분합니다.';
+    $('sim-behavior-run').disabled = busy || pool.length < 2;
+    if (!lastBehavior) $('sim-behavior-status').textContent = `${speed==='slow'?'완속':'급속'} A/B에서 기존 예시값과 ${sim.behaviorDefault(speed).label}을 비교합니다.`;
+    $('sim-behavior-reference-content').innerHTML = behaviorReferenceHTML();
   }
   function behaviorReferenceHTML() {
+    if($('sim-speed').value==='slow') {
+      const b=sim.behaviorReferenceSlow,x=sim.behaviorConversion('slow'),a=sim.behaviorAdoptions.slowLiterature;
+      return `<p>완속 잠정 기준: s=1, α=510원/km, β=220원/분, τ=10,000원. s=1은 정규화이며 측정된 가격 민감도가 아닙니다.</p>
+        ${['alpha','beta','tau'].map(k=>`<p><a href="${escape(b[k].url)}" target="_blank" rel="noopener">${escape(b[k].title)}</a><br>${escape(b[k].pages)}<br>${escape(b[k].basis)}</p>`).join('')}
+        <p>α=15,205÷30=${fmt(x.alpha,2)}원/km<br>β=9.44×1,400÷60=${fmt(x.beta,2)}원/분 (평균 WTP 환산 ${fmt(x.betaMean,2)}원/분과 구분)<br>τ=1,700÷0.169=${fmt(x.tau,2)}원. 1회 요금 계수이므로 충전량을 다시 곱하지 않습니다.</p>
+        <p>속도·환율은 고정 환산 가정이며 현재 실측값이 아닙니다. 완속은 서로 다른 연구를 조합한 대리값으로 공동 추정된 계수가 아닙니다. 현재 입력의 kWh당 단가×충전량을 1회 비용으로 계산한 A/B 모형에 근사 이전합니다. 충전량 변경 시 계수는 고정됩니다.</p>
+        <p>${a.limitations.map(escape).join('<br>')}</p><p><a href="https://github.com/ms3011975/ev-hackathon.github.io/blob/main/docs/behavior-presets.md" target="_blank" rel="noopener">팀 공유용 채택 근거와 비교 방법</a></p>`;
+    }
     const b = sim.behaviorReference, x = sim.behaviorConversion();
     return `<p><a href="${escape(b.url)}" target="_blank" rel="noopener">${escape(b.title)}</a><br>${escape(b.pages)}<br>${escape(b.population)}</p>
       <p>원문 계수: 비용 −0.132 (USD/100마일 충전분), 우회시간 −0.066/분, 대기시간 −0.050/분, 충전거리 탄력성 0.35168.</p>
@@ -336,7 +346,7 @@
     $('sim-connect').disabled = active;
     $('sim-road-reload').disabled = active || $('sim-distanceMode').value!=='road';
     $('sim-timing-load').disabled = active || $('sim-mode').value!=='real';
-    $('sim-behavior-run').disabled = active || $('sim-speed').value !== 'fast' || pool.length < 2;
+    $('sim-behavior-run').disabled = active || pool.length < 2;
     if (!active) $('sim-region').disabled = $('sim-mode').value === 'demo';
   }
   function render(result) {
@@ -353,7 +363,7 @@
         ['전체 평균 실제 대기 (분)', r => fmt(r.wait, 2)], ['선택 당시 예상 대기 (분)', r => fmt(r.expectedWait, 2)], ['평균 대기 표준오차 (분)', r => fmt(r.waitSE, 2)],
         ['고정 대비 대기 변화 (%)', r => r.waitChange === null ? '산정 불가 (기준 0분)' : fmt(r.waitChange)], ['평균 충전요금 (원/명)', r => fmt(r.fee)],
         ['평균 추가 거리 (km/명)', r => fmt(r.distance, 3)], ['총 할인 혜택 (원)', r => fmt(r.discount)], ['요금 수입 (원)', r => fmt(r.revenue)],
-        ['고정 대비 수입 차이 (원)', r => fmt(r.revenueChange)], ['마지막 충전 완료 (시작 후 분)', r => fmt(r.completion)]
+        ['고정 대비 수입 차이 (원)', r => fmt(r.revenueChange)], ['할인 적용 신규 세션 (건/회)', r => fmt(r.discountedCount)], ['할증 적용 신규 세션 (건/회)', r => fmt(r.surchargedCount)], ['마지막 충전 완료 (시작 후 분)', r => fmt(r.completion)]
       ].map(([label, get]) => `<tr><th scope="row">${label}</th>${results.map(r => `<td>${get(r)}</td>`).join('')}</tr>`).join('')}
       </tbody></table></div><div class="sim-actions"><button id="sim-export" type="button">결과 CSV 다운로드</button></div><details style="margin-top:15px"><summary>이 실행에 사용한 값의 근거</summary>${evidenceTable(result.evidence)}</details></div>
       <div class="sim-charts"><div class="sim-card"><h3>충전소 선택 인원</h3><p class="sim-legend"><span></span>A &nbsp; <span></span>B · 명/회</p>${results.map(r => `<div class="sim-bar-row"><div class="sim-bar-label"><span>${r.label}</span><b>A ${fmt(r.count[0])} / B ${fmt(r.count[1])}명</b></div><div class="sim-track" role="img" aria-label="${r.label}: A ${fmt(r.count[0])}명, B ${fmt(r.count[1])}명"><div class="sim-fill" style="width:${r.share[0] * 100}%"></div><div class="sim-fill-b" style="width:${r.share[1] * 100}%"></div></div></div>`).join('')}</div>
@@ -372,8 +382,8 @@
     const rows = [['항목', '값'], ['데이터 출처', context.source], ['지역', context.region], ['결과 구분', '가상 시뮬레이션 · 회당 평균'],
       ...Object.entries(o), ...Object.entries(context), ...stations.flatMap((s, i) => Object.entries(s).map(([k, v]) => [`${i ? 'B' : 'A'}_${k}`, v])), [],
       ['입력 근거 항목', '값', '구분', '근거와 한계'], ...last.evidence.map(r => [r.item, r.value, r.kind, r.basis]), [],
-      ['정책', 'A단가_원kWh', 'B단가_원kWh', 'A선택_명', 'B선택_명', 'A비율', 'B비율', '실제대기_분', '예상대기_분', '대기표준오차_분', '고정대비대기변화_pct', '평균요금_원', '평균추가거리_km', '총할인혜택_원', '수입_원', '고정대비수입차이_원', '마지막완료_분'],
-      ...results.map(r => [r.label, ...r.prices, ...r.count, ...r.share, r.wait, r.expectedWait, r.waitSE, r.waitChange, r.fee, r.distance, r.discount, r.revenue, r.revenueChange, r.completion])];
+      ['정책', 'A단가_원kWh', 'B단가_원kWh', 'A선택_명', 'B선택_명', 'A비율', 'B비율', '실제대기_분', '예상대기_분', '대기표준오차_분', '고정대비대기변화_pct', '평균요금_원', '평균추가거리_km', '총할인혜택_원', '수입_원', '고정대비수입차이_원', '마지막완료_분','할인적용_건','할증적용_건'],
+      ...results.map(r => [r.label, ...r.prices, ...r.count, ...r.share, r.wait, r.expectedWait, r.waitSE, r.waitChange, r.fee, r.distance, r.discount, r.revenue, r.revenueChange, r.completion,r.discountedCount,r.surchargedCount])];
     downloadRows(`essential-simulation-${o.seed}.csv`, rows);
   }
   function downloadRows(filename, rows) {
@@ -402,6 +412,7 @@
   function presetSweep() {
     invalidateSweep();
     const key = $('sim-sweep-key').value;
+    if(sim.policyComparisons[key]) { $('sim-sweep-values').value=sim.policyComparisons[key].map(v=>Number((v*100).toFixed(3))).join(',');return; }
     if (key === 'durationMode') { $('sim-sweep-values').value = $('sim-mode').value==='real' ? 'sessions,power' : 'assumed,power'; return; }
     const field = fields.find(f => f[0] === key), current = +$('sim-' + key).value;
     const vals = current === 0 ? [0, Math.max(field[3], policiesFields.has(key) ? 10 : 1), Math.max(field[3], policiesFields.has(key) ? 20 : 2)] : [.5, 1, 1.5].map(m => current * m);
@@ -416,8 +427,8 @@
     const stable = new Set(winners).size === 1;
     $('sim-sweep-results').innerHTML = `<p class="sim-note" id="sim-sweep-state">${escape(output.context.source)} · ${escape(output.context.region)}<br>비교 항목: ${escape(label)} · 현재 기준값 ${escape(levelLabel(output.key, output.baseline))}<br>요금 기준: ${escape(output.context.pricingBasis)} · ${escape(output.context.forecastInfo)}<br>반복 ${output.base.repeats}회 · 시드 ${output.base.seed} · 다른 입력과 초기 상태 고정</p>
       <p class="sim-status">${stable ? '이 비교 범위에서는 평균 대기 최소 정책 집합이 유지됐습니다.' : '수준에 따라 평균 대기 최소 정책 집합이 달라졌습니다. 가정에 따라 정책 순위가 바뀔 수 있습니다.'} 0.01분 미만 차이는 공동 최소로 표시합니다. 통계적 유의성 판정이나 전역 최적 정책은 아닙니다.</p>
-      <div class="sim-table-wrap"><table class="sim-table"><caption>한 항목씩 변경 · 반복 1회당 평균</caption><thead><tr><th>${escape(label)}</th><th>정책</th><th>A / B 선택 (명)</th><th>B 비율 (%)</th><th>대기 (분)</th><th>현재값 대비 대기 차이 (분)</th><th>현재값 대비 B 비율 차이 (%p)</th><th>고정요금 대비 대기 (%)</th><th>요금 (원/명)</th><th>추가 거리 (km/명)</th><th>총 할인 (원)</th><th>수입 차이 (원)</th></tr></thead><tbody>
-      ${output.scenarios.map(s => s.results.map(r => `<tr><th scope="row">${escape(levelLabel(output.key,s.value))}${s.value === output.baseline ? ' · 현재값' : ''}</th><td>${r.label}</td><td>${fmt(r.count[0])} / ${fmt(r.count[1])}</td><td>${fmt(r.share[1]*100)}</td><td>${fmt(r.wait,2)}</td><td>${fmt(r.waitDelta,2)}</td><td>${fmt(r.shareBDelta,2)}</td><td>${r.waitChange === null ? '기준 0분' : fmt(r.waitChange)}</td><td>${fmt(r.fee)}</td><td>${fmt(r.distance,3)}</td><td>${fmt(r.discount)}</td><td>${fmt(r.revenueChange)}</td></tr>`).join('')).join('')}</tbody></table></div>
+      <div class="sim-table-wrap"><table class="sim-table"><caption>한 항목씩 변경 · 반복 1회당 평균</caption><thead><tr><th>${escape(label)}</th><th>정책</th><th>A / B 선택 (명)</th><th>B 비율 (%)</th><th>대기 (분)</th><th>현재값 대비 대기 차이 (분)</th><th>현재값 대비 B 비율 차이 (%p)</th><th>고정요금 대비 대기 (%)</th><th>요금 (원/명)</th><th>추가 거리 (km/명)</th><th>총 할인 (원)</th><th>수입 차이 (원)</th><th>할인 / 할증 적용 (건/회)</th><th>수입 (원)</th></tr></thead><tbody>
+      ${output.scenarios.map(s => s.results.map(r => `<tr><th scope="row">${escape(levelLabel(output.key,s.value))}${s.value === output.baseline ? ' · 현재값' : ''}</th><td>${r.label}</td><td>${fmt(r.count[0])} / ${fmt(r.count[1])}</td><td>${fmt(r.share[1]*100)}</td><td>${fmt(r.wait,2)}</td><td>${fmt(r.waitDelta,2)}</td><td>${fmt(r.shareBDelta,2)}</td><td>${r.waitChange === null ? '기준 0분' : fmt(r.waitChange)}</td><td>${fmt(r.fee)}</td><td>${fmt(r.distance,3)}</td><td>${fmt(r.discount)}</td><td>${fmt(r.revenueChange)}</td><td>${fmt(r.discountedCount)} / ${fmt(r.surchargedCount)}</td><td>${fmt(r.revenue)}</td></tr>`).join('')).join('')}</tbody></table></div>
       <div class="sim-table-wrap"><table class="sim-table"><caption>부하 민감도 · 15분 평균 부하의 반복별 피크 평균</caption><thead><tr><th>${escape(label)}</th><th>정책</th><th>A 피크 (kW)</th><th>B 피크 (kW)</th><th>합산 피크 (kW)</th><th>고정 대비 합산 저감률 (%)</th><th>기간 이후 충전량 (kWh)</th></tr></thead><tbody>${output.scenarios.map(s=>s.results.map(r=>`<tr><th>${escape(levelLabel(output.key,s.value))}</th><td>${r.label}</td><td>${fmt(r.load.stationPeakKw?.[0])}</td><td>${fmt(r.load.stationPeakKw?.[1])}</td><td>${fmt(r.load.combinedPeakKw)}</td><td>${fmt(r.load.combinedPeakReductionPct)}</td><td>${fmt(r.load.tailEnergyKwh)}</td></tr>`).join('')).join('')}</tbody></table></div>
       <p class="sim-note">저감률은 해당 수준의 고정요금 대비이며 양수는 감소, 음수는 증가입니다. 20~40분 가정의 등가 전력은 대표 출력을 넘을 수 있습니다. 부하 해석에는 출력 기반 모드를 권장합니다. 위 정책 순위 안내는 피크가 아닌 대기시간 기준입니다.</p>
       <div class="sim-charts">${sim.policies.map((label,p) => `<div><h4>${label} · 평균 대기</h4>${output.scenarios.map(s => `<div class="sim-bar-row"><div class="sim-bar-label"><span>${escape(levelLabel(output.key,s.value))}${s.value === output.baseline ? ' (현재값)' : ''}</span><b>${fmt(s.results[p].wait,2)}분</b></div><div class="sim-track"><div class="sim-fill sim-wait" style="width:${s.results[p].wait/maxWait*100}%"></div></div></div>`).join('')}</div>`).join('')}</div>
@@ -431,8 +442,8 @@
     const s = lastSweep;
     const rows = [['분석','한 항목씩 변경하는 시나리오 민감도 분석'],['비교 항목',sweepLabel(s.key)],['현재 기준값',s.baseline],
       ...Object.entries(s.context), ...Object.entries(s.base), [], ['기준 입력 근거','값','구분','근거와 한계'], ...s.evidence.map(r=>[r.item,r.value,r.kind,r.basis]), [],
-      ['수준_내부단위','수준_화면단위','현재값여부','정책','A선택_명','B선택_명','B비율_pct','평균대기_분','대기SE_분','현재값대비대기차이_분','현재값대비B비율차이_pp','고정대비대기변화_pct','평균요금_원','평균거리_km','총할인_원','수입_원','고정대비수입차이_원','A단가','B단가'],
-      ...s.scenarios.flatMap(level=>level.results.map(r=>[level.value,levelLabel(s.key,level.value),level.value===s.baseline,r.label,...r.count,r.share[1]*100,r.wait,r.waitSE,r.waitDelta,r.shareBDelta,r.waitChange,r.fee,r.distance,r.discount,r.revenue,r.revenueChange,...r.prices]))];
+      ['수준_내부단위','수준_화면단위','현재값여부','정책','A선택_명','B선택_명','B비율_pct','평균대기_분','대기SE_분','현재값대비대기차이_분','현재값대비B비율차이_pp','고정대비대기변화_pct','평균요금_원','평균거리_km','총할인_원','수입_원','고정대비수입차이_원','A단가','B단가','할인적용_건','할증적용_건'],
+      ...s.scenarios.flatMap(level=>level.results.map(r=>[level.value,levelLabel(s.key,level.value),level.value===s.baseline,r.label,...r.count,r.share[1]*100,r.wait,r.waitSE,r.waitDelta,r.shareBDelta,r.waitChange,r.fee,r.distance,r.discount,r.revenue,r.revenueChange,...r.prices,r.discountedCount,r.surchargedCount]))];
     for (const level of s.scenarios) rows.push([],['수준별 입력 근거',level.value],['항목','값','구분','근거와 한계'],...level.evidence.map(r=>[r.item,r.value,r.kind,r.basis]));
     rows.push([],['부하 민감도: 15분 등가 부하. 실제 배전망 실측 아님'],['수준','정책','A피크_kW','B피크_kW','합산피크_kW','고정대비합산저감_pct','기간이후충전량_kWh','대표출력초과신규차량_명']);
     for (const level of s.scenarios) for (const r of level.results) rows.push([level.value,r.label,...(r.load.stationPeakKw || ['', '']),r.load.combinedPeakKw,r.load.combinedPeakReductionPct,r.load.tailEnergyKwh,r.load.overRatedSessions]);
@@ -482,8 +493,8 @@
     finally { lock(false); $('sim-progress').hidden = true; }
   });
   $('sim-form').addEventListener('input', invalidate);
-  $('sim-behaviorPreset').addEventListener('change', ()=>{behaviorAutoFallback=false;updateBehavior(true);invalidate();});
-  for (const key of sim.behaviorKeys) $('sim-'+key).addEventListener('input', ()=>{behaviorAutoFallback=false;$('sim-behaviorPreset').value='custom';updateBehavior();invalidate();});
+  $('sim-behaviorPreset').addEventListener('change', ()=>{updateBehavior(true);invalidate();});
+  for (const key of sim.behaviorKeys) $('sim-'+key).addEventListener('input', ()=>{$('sim-behaviorPreset').value='custom';updateBehavior();invalidate();});
   $('sim-behavior-run').addEventListener('click', async () => {
     if (busy || !$('sim-form').reportValidity()) return;
     cancelBehavior = false; lock(true); $('sim-behavior-cancel').hidden = false;
@@ -492,7 +503,7 @@
       $('sim-behavior-status').textContent = '예측과 충전소 상태를 한 번 읽어 두 설정에 공유합니다…';
       const prediction = await preparePrediction(); await ensureRoad(); await ensureTiming(); const capturedContext = context(prediction);
       const output = await sim.compareBehavior(selected(), options(prediction), p => {$('sim-behavior-status').textContent=`행동계수 비교 중… ${Math.round(p*100)}%`;}, prediction?.utilizationById, ()=>cancelBehavior);
-      output.context = {...capturedContext,behaviorPreset:'legacy vs literature'};
+      output.context = {...capturedContext,behaviorPreset:'legacy vs '+sim.behaviorDefault(capturedContext.speed).id};
       for (const p of output.profiles) {
         p.context = {...capturedContext,behaviorPreset:p.id};
         p.evidence = sim.evidence(p.stations,p.options,p.context);

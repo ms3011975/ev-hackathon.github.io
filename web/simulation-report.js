@@ -32,6 +32,9 @@
     ['평균 추가 거리 (km/명)', r => r.distance],
     ['평균 충전비 (원/명)', r => r.fee],
     ['총 할인 혜택 (원)', r => r.discount],
+    ['할인 적용 신규 세션 (건/회)', r => r.discountedCount],
+    ['할증 적용 신규 세션 (건/회)', r => r.surchargedCount],
+    ['단순 충전 매출 (원)', r => r.revenue],
     ['고정 대비 단순 매출 차이 (원)', r => r.revenueChange]
   ];
   const valid = result => result.results.every(r => r.load?.available);
@@ -111,7 +114,7 @@
   function behaviorRender(output) {
     const c = output.context || {}, p = output.profiles[0].population;
     return `<p class="sim-note">${esc(c.source || '')} · ${esc(c.region || '')} · 실행 ${esc(kst(c.executedAt || '기록 없음'))}<br>${esc(c.pricingBasis || '')} · ${esc(c.forecastInfo || '')}</p>
-      <p>기존 예시값(s=1, α=600, β=300, τ=2000)과 팀 채택 문헌 기준(s=1, α=950, β=360, τ=7200)를 함께 바꿔 비교했습니다. A/B·예측 구간·차량·도착 시각·초기 잔여시간·선택 난수·요금 정책은 공유합니다. 현재 입력한 사용자 행동계수와의 비교는 아닙니다.</p>
+      <p>${output.profiles.map(profile=>`${esc(profile.label)}(s=${esc(profile.options.sensitivity)}, α=${esc(profile.options.alpha)}, β=${esc(profile.options.beta)}, τ=${esc(profile.options.tau)})`).join('과 ')}을 비교했습니다. A/B·예측 구간·차량·도착 시각·초기 잔여시간·선택 난수·요금 정책은 공유합니다. 현재 입력한 사용자 행동계수와의 비교는 아닙니다. ${c.speed==='slow'?'완속 기준은 서로 다른 연구를 조합한 대리값으로 공동 추정·충북 행동 검증 전입니다.':''}</p>
       <p class="sim-note">반복 ${output.base.repeats}회 · 기대 신규 ${fmt(p.expected,3)}명 · 생성 평균 ${fmt(p.mean,3)}명 (${p.min}~${p.max}) · 0명 반복 ${p.emptyRuns}회. 신규 차량이 적으면 선택 비율과 정책 효과 해석에 주의하세요.</p>${roadNotice(output.base,c)}
       <div class="sim-table-wrap"><table class="sim-table"><caption>2개 행동계수 설정 × 3개 요금 정책 · 피크는 15분 평균 부하의 반복별 최대값 평균</caption><thead><tr>${behaviorHeaders.map(h=>`<th scope="col">${esc(h)}</th>`).join('')}</tr></thead><tbody>${behaviorRows(output).map(row=>`<tr>${row.map((v,i)=>i<2?`<th scope="row">${esc(v)}</th>`:`<td>${fmt(v)}</td>`).join('')}</tr>`).join('')}</tbody></table></div>
       <p class="sim-note">피크 저감률은 각 행동계수 설정 안에서 고정요금과 비교합니다. 오른쪽 두 변화 열은 같은 요금 정책에서 행동계수만 바꾼 차이입니다. 피크 차이가 음수이면 팀 채택 기준에서 더 낮습니다. 가정 민감도 비교이며 팀 채택 기준의 정확도나 최적 정책을 입증하지 않습니다.</p>`;
